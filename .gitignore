@@ -1,0 +1,21 @@
+# Local CAD sample files (large, not part of the repository)
+/samples/
+
+# Python
+/.venv/
+__pycache__/
+
+# Node
+node_modules/
+
+# Genererat
+/out/
+
+# Build output
+/dist/
+/release/
+/build/python-runtime/
+/build/python-runtime-win/
+/build/python-runtime-mac/
+/build/cache/
+/build/python-extract/

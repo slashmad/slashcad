@@ -1,0 +1,66 @@
+appId: com.slashmad.slashcad
+productName: SlashCAD
+executableName: slashcad
+directories:
+  output: release
+  buildResources: build
+files:
+  - dist/**
+  - package.json
+asarUnpack:
+  - dist/mcp/**
+extraResources:
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD-PARTY-NOTICES.md
+    to: THIRD-PARTY-NOTICES.md
+  - from: licenses
+    to: licenses
+  - from: python/slashcad_worker
+    to: python-src/slashcad_worker
+    filter: ["**/*.py"]
+  - from: examples/demo
+    to: examples/demo
+    filter: ["*.py"]
+linux:
+  # Relocatable CPython + build123d, created by `npm run python:setup -- --bundle`.
+  extraResources:
+    - from: build/python-runtime
+      to: python
+  category: Graphics
+  # Icon set copied from build/SlashCAD-transparent-icons by `npm run icon`.
+  icon: build/icons
+  target: [AppImage, deb, rpm]
+  executableArgs: ["--ozone-platform-hint=auto"]
+  maintainer: slashmad
+  synopsis: Local CAD workbench for build123d driven by Claude Code and Codex
+deb:
+  depends: ["libgtk-3-0 | libgtk-3-0t64", "libnss3", "libxss1", "libasound2 | libasound2t64"]
+rpm:
+  depends: ["gtk3", "nss", "libXScrnSaver", "alsa-lib"]
+appImage:
+  artifactName: SlashCAD-${version}-${arch}.AppImage
+win:
+  # Created by `node scripts/setup-python.mjs --bundle --target win`.
+  extraResources:
+    - from: build/python-runtime-win
+      to: python
+  icon: build/icon.ico
+  # Installer, single-file portable exe and a zip that runs without installing.
+  target: [nsis, portable, zip]
+  artifactName: SlashCAD-${version}-win-${arch}.${ext}
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: SlashCAD-Setup-${version}.exe
+portable:
+  artifactName: SlashCAD-Portable-${version}.exe
+mac:
+  # Built on macOS only (CI); created by `node scripts/setup-python.mjs --bundle` on a Mac.
+  extraResources:
+    - from: build/python-runtime-mac
+      to: python
+  icon: build/icon.png
+  category: public.app-category.graphics-design
+  target: [dmg, zip]
+  artifactName: SlashCAD-${version}-mac-${arch}.${ext}

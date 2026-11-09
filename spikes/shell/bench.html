@@ -1,0 +1,146 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>webgl bench</title>
+<style>html,body{margin:0;height:100%;background:#1b1d22;overflow:hidden}canvas{display:block}#s{position:fixed;top:8px;left:8px;color:#ddd;font:13px monospace}</style>
+<script type="importmap">{"imports":{"three":"/node_modules/three/build/three.module.js","three/addons/":"/node_modules/three/examples/jsm/"}}</script>
+</head>
+<body>
+<div id="s">loading…</div>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
+
+const q = new URLSearchParams(location.search);
+const engine = q.get("engine") || "unknown";
+const model = q.get("model");
+const status = (t) => (document.getElementById("s").textContent = t);
+const report = (r) => fetch("/result?engine=" + encodeURIComponent(engine), { method: "POST", body: JSON.stringify(r) });
+
+try {
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+  const gl = renderer.getContext();
+  const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+  const gpu = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1b1d22);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x444455, 1.2));
+  const sun = new THREE.DirectionalLight(0xffffff, 1.5);
+  scene.add(sun);
+  const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 0.1, 10000);
+
+  let t0 = performance.now();
+  const gltf = await new GLTFLoader().loadAsync(model);
+  const loadMs = performance.now() - t0;
+
+  t0 = performance.now();
+  let tris = 0, meshes = 0;
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x111111 });
+  const edgeGroup = new THREE.Group();
+  gltf.scene.traverse((o) => {
+    if (o.isMesh) {
+      meshes++;
+      const g = o.geometry;
+      tris += (g.index ? g.index.count : g.attributes.position.count) / 3;
+      o.material = new THREE.MeshStandardMaterial({ color: o.material?.color ?? 0x9aa4b2, metalness: 0.1, roughness: 0.6,
+        polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+      const e = new THREE.LineSegments(new THREE.EdgesGeometry(g, 30), edgeMat);
+      o.updateWorldMatrix(true, false);
+      e.applyMatrix4(o.matrixWorld);
+      edgeGroup.add(e);
+    }
+  });
+  let edgesMs = performance.now() - t0;
+  let drawables = gltf.scene, edgeDrawables = edgeGroup, mergeMs = 0;
+  if (q.get("merge") === "1") {
+    // CAD exporters emit one mesh per B-rep face; merge into one mesh per colour + one edge batch.
+    t0 = performance.now();
+    const byColour = new Map();
+    gltf.scene.traverse((o) => {
+      if (!o.isMesh) return;
+      o.updateWorldMatrix(true, false);
+      const g = o.geometry.clone().applyMatrix4(o.matrixWorld);
+      for (const k of Object.keys(g.attributes)) if (k !== "position" && k !== "normal") g.deleteAttribute(k);
+      if (!g.attributes.normal) g.computeVertexNormals();
+      const key = o.material.color.getHexString();
+      if (!byColour.has(key)) byColour.set(key, { mat: o.material, geos: [] });
+      byColour.get(key).geos.push(g.index ? g.toNonIndexed() : g);
+    });
+    drawables = new THREE.Group();
+    for (const { mat, geos } of byColour.values()) drawables.add(new THREE.Mesh(mergeGeometries(geos, false), mat));
+    edgeDrawables = new THREE.LineSegments(mergeGeometries(edgeGroup.children.map((e) => e.geometry.applyMatrix4(e.matrix)), false), edgeMat);
+    mergeMs = performance.now() - t0;
+  }
+  scene.add(drawables, edgeDrawables);
+
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = box.getSize(new THREE.Vector3()).length() * 0.9;
+
+  const place = (a) => {
+    camera.position.set(center.x + radius * Math.cos(a), center.y + radius * 0.5, center.z + radius * Math.sin(a));
+    camera.lookAt(center);
+    sun.position.copy(camera.position);
+  };
+
+  // First frame (shader compile + upload).
+  place(0);
+  t0 = performance.now();
+  renderer.render(scene, camera);
+  gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+  const firstFrameMs = performance.now() - t0;
+
+  // Phase A: normal rAF orbit.
+  const deltas = [];
+  await new Promise((done) => {
+    const start = performance.now();
+    let last = start;
+    const step = (now) => {
+      deltas.push(now - last); last = now;
+      place((now - start) / 2000);
+      renderer.render(scene, camera);
+      status(`${engine} A ${((now - start) / 1000).toFixed(1)}s`);
+      if (now - start < 8000) requestAnimationFrame(step); else done();
+    };
+    requestAnimationFrame(step);
+  });
+  deltas.shift();
+
+  // Phase B: forced-sync cost of one render (headroom above vsync).
+  const costs = [];
+  for (let i = 0; i < 120; i++) {
+    place(i / 20);
+    const s = performance.now();
+    renderer.render(scene, camera);
+    gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(4));
+    costs.push(performance.now() - s);
+    if (i % 20 === 0) await new Promise(requestAnimationFrame);
+  }
+
+  const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return +s[Math.min(s.length - 1, Math.floor(p * s.length))].toFixed(2); };
+  const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const r = {
+    engine, ua: navigator.userAgent, gpu, webgl2: renderer.capabilities.isWebGL2,
+    dpr: devicePixelRatio, canvas: [renderer.domElement.width, renderer.domElement.height],
+    model, meshes, draw_meshes: drawables.children.length || 1, merge_ms: +mergeMs.toFixed(0),
+    tris: Math.round(tris), load_ms: +loadMs.toFixed(0), edges_ms: +edgesMs.toFixed(0),
+    first_frame_ms: +firstFrameMs.toFixed(1),
+    rAF_fps: +(1000 / avg(deltas)).toFixed(1), frame_p50_ms: pct(deltas, 0.5), frame_p95_ms: pct(deltas, 0.95),
+    frame_p99_ms: pct(deltas, 0.99), frames_over_25ms: deltas.filter((d) => d > 25).length, frames: deltas.length,
+    sync_render_p50_ms: pct(costs, 0.5), sync_render_p95_ms: pct(costs, 0.95),
+  };
+  status(JSON.stringify(r));
+  await report(r);
+} catch (e) {
+  status("ERROR " + e);
+  await report({ engine, error: String(e && e.stack || e) });
+}
+</script>
+</body>
+</html>
