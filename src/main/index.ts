@@ -439,7 +439,8 @@ app.whenReady().then(async () => {
     highlight: (ids, message) => send("viewer:highlight", { ids, message }),
     sceneChanged: () => project && send("project:info", project.info),
   });
-  await hub.start();
+  // The CAD tools for agents must never keep the window from opening.
+  try { await hub.start(); } catch (e) { console.error("MCP hub:", e); }
   hub.on("activity", (a) => send("mcp:activity", a));
   worker.on("stderr", (d: string) => send("cad:stderr", d));
   worker.start();
@@ -512,6 +513,10 @@ app.whenReady().then(async () => {
       || (!app.isPackaged ? join(app.getAppPath(), "examples", "demo") : undefined);
     if (initial) void openPath(initial, process.env.SLASHCAD_PROJECT || initial.endsWith(join("examples", "demo")) ? { trusted: true } : {});
   });
+}).catch((e) => {
+  // A start-up error must not leave an invisible process behind (Task Manager only).
+  dialog.showErrorBox("SlashCAD could not start", String(e?.stack ?? e));
+  app.exit(1);
 });
 
 app.on("second-instance", (_e, argv) => {

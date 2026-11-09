@@ -3,7 +3,7 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { connect, createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { McpActivity, ViewName } from "../shared/types";
@@ -24,7 +24,8 @@ export const VIEW_ENUM = VIEWS;
 
 export class McpHub extends EventEmitter {
   readonly token: string;
-  readonly address: string;
+  /** Stable per-user address; a per-process one when another SlashCAD already listens there. */
+  address: string;
   private server: Server | null = null;
   private tools = new Map<string, ToolImpl>();
 
@@ -57,12 +58,40 @@ export class McpHub extends EventEmitter {
     return [...this.tools.entries()].map(([name, t]) => ({ name, description: t.description, inputSchema: t.inputSchema }));
   }
 
+  /**
+   * Listens on the stable address. Another SlashCAD with a different data folder (the installed
+   * app next to the portable exe, a test profile) may already own it: then this instance uses a
+   * per-process address. In-app agents get the address explicitly, so they still reach this
+   * window; only a VS Code .mcp.json keeps talking to the first instance.
+   */
   async start(): Promise<void> {
-    if (process.platform !== "win32" && existsSync(this.address)) unlinkSync(this.address);
-    this.server = createServer((sock) => this.onConnection(sock));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.once("error", reject);
-      this.server!.listen(this.address, () => resolve());
+    if (await this.inUse(this.address) || !(await this.listen(this.address))) {
+      this.address = `${this.address.replace(/\.sock$/, "")}-${process.pid}${process.platform === "win32" ? "" : ".sock"}`;
+      if (!(await this.listen(this.address))) throw new Error(`cannot listen on ${this.address}`);
+    }
+  }
+
+  /** True when a live server answers at `address` (a stale Unix socket file is removed). */
+  private inUse(address: string): Promise<boolean> {
+    if (process.platform !== "win32" && !existsSync(address)) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      const sock = connect(address);
+      const done = (live: boolean) => {
+        sock.destroy();
+        if (!live && process.platform !== "win32") { try { unlinkSync(address); } catch { /* gone */ } }
+        resolve(live);
+      };
+      sock.once("connect", () => done(true));
+      sock.once("error", () => done(false));
+      sock.setTimeout(1000, () => done(false));
+    });
+  }
+
+  private listen(address: string): Promise<boolean> {
+    const server = createServer((sock) => this.onConnection(sock));
+    return new Promise((resolve) => {
+      server.once("error", () => resolve(false));
+      server.listen(address, () => { this.server = server; resolve(true); });
     });
   }
 
