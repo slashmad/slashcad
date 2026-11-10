@@ -235,11 +235,6 @@ uses. `npm run notices` regenerates `THIRD-PARTY-NOTICES.md` after dependency ch
 | `examples/demo/` | The demo project shown on first start |
 | `spikes/` | Early measurements that informed the design (Electron vs WebKitGTK, agent bridges, STEP caching) |
 
-## Former name
-
-Up to version 0.2.8 the app was called "Slashmad CAD Editor". Its settings, `.slashmad/` project
-folders and scripts using `from slashmad import show` are picked up automatically.
-
 ## License
 
 MIT, see [LICENSE](LICENSE). You are free to use, change and redistribute it, also commercially.

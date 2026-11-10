@@ -1,6 +1,6 @@
 # Third-party notices
 
-SlashCAD 0.2.8 is MIT-licensed (see LICENSE). Its installers and archives also contain the
+SlashCAD 0.3.0-fix is MIT-licensed (see LICENSE). Its installers and archives also contain the
 third-party software below, each under its own licence. Full licence texts are shipped with each component:
 Python packages in `resources/python/…/site-packages/<name>-<version>.dist-info/`, CPython in
 `resources/python/lib/python3.13/LICENSE.txt` (Windows: `resources/python/LICENSE.txt`), Electron and Chromium in
