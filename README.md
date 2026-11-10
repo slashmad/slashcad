@@ -243,3 +243,10 @@ The packages bundle third-party software under its own licences: Electron/Chromi
 build123d, Open CASCADE Technology (LGPL-2.1 with the Open CASCADE exception), NumPy, SciPy and
 others. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md). Claude Code, Codex and SolidCraft
 are not bundled and are subject to their own terms.
+
+## Support
+
+Like SlashCAD? Buy me a beer 🍺
+
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-buy%20me%20a%20beer-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/slashmad)
+[![Liberapay](https://img.shields.io/badge/Liberapay-donate-F6C915?logo=liberapay&logoColor=black)](https://liberapay.com/slashmad/)
