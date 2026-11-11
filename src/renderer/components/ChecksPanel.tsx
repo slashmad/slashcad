@@ -21,7 +21,7 @@ interface Props {
 }
 
 const errText = (e: any) => String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, "");
-const mark = (s: string) => (s === "fail" ? "✕" : s === "warn" ? "!" : "✓");
+const mark = (s: string) => (s === "fail" ? "✕" : s === "warn" ? "!" : s === "incomplete" ? "?" : "✓");
 
 export function ChecksPanel(p: Props) {
   const t = useT();
@@ -107,8 +107,9 @@ function Rules(p: Props & Ctx & { report: DesignReport | null; design: DesignFil
   return (
     <div className="chk-body">
       <div className="chk-head">
-        <span className={`chk-sum ${r?.summary.fail ? "bad" : r?.summary.warn ? "warn" : r ? "ok" : ""}`}>
+        <span className={`chk-sum ${r?.summary.fail ? "bad" : r?.summary.warn || r?.complete === false ? "warn" : r ? "ok" : ""}`}>
           {!r ? t("chk.notRun") : r.error ? t("chk.failedRun") : r.skipped ? r.skipped : t("chk.summary", { f: r.summary.fail, w: r.summary.warn, p: r.summary.pass, b: r.build })}
+          {r?.complete === false ? ` · ${t("chk.incompleteRun")}` : ""}
         </span>
         <button disabled={p.busy || !p.build} onClick={() => p.act(() => api.checks.run())}>{t("chk.runChecks")}</button>
       </div>
@@ -132,6 +133,7 @@ function Rules(p: Props & Ctx & { report: DesignReport | null; design: DesignFil
       {r && !r.error && !r.skipped && <div className="muted small pad-x">{t("chk.nominalNote")}</div>}
 
       <div className="chk-sub">{t("chk.rulesTitle", { n: rules.length })}</div>
+      {p.design?.error && <div className="chk-error">{p.design.error}</div>}
       {!rules.length && <div className="muted small pad-x">{t("chk.noRules")}</div>}
       {rules.map((x) => (
         <div key={x.id} className="chk-rule">
@@ -224,6 +226,7 @@ function Motion(p: Props & Ctx & { sweep: SweepResult | null; design: DesignFile
             {t("chk.sweepSummary", { n: s.poses_checked, total: s.values.length, p: s.param, s: s.seconds })}
             {!s.complete ? ` ${t("chk.incomplete")}` : ""}
           </div>
+          <div className="muted small pad-x">{t("chk.sampledNote")}</div>
           {s.failing_poses.length > 0 && <div className="chk-sub">{t("chk.failingPoses")}</div>}
           {s.poses.filter((x) => x.interferences || x.rule_failures.length || x.errors.length).slice(0, 40).map((x) => (
             <div key={x.value} className="chk-row fail small" onClick={() => { preview(x.value); p.show(x.worst ? [x.worst.a, x.worst.b] : undefined); }} title={t("chk.clickPose")}>

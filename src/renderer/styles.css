@@ -350,7 +350,8 @@ kbd { display: inline-block; background: #2a2f39; border: 1px solid #3c4350; bor
 .chk-mark { width: 12px; flex: none; text-align: center; font-weight: 700; }
 .chk-row.pass .chk-mark { color: var(--ok); }
 .chk-row.fail .chk-mark { color: var(--bad); }
-.chk-row.warn .chk-mark { color: var(--warn); }
+.chk-row.warn .chk-mark, .chk-row.incomplete .chk-mark { color: var(--warn); }
+.chk-row.incomplete { color: #ffd59a; }
 .chk-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .chk-sub { margin: 8px 10px 2px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
 .chk-rule { display: flex; gap: 6px; align-items: flex-start; padding: 3px 10px; font-size: 12px; }

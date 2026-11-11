@@ -199,14 +199,20 @@ export function registerTools(hub: McpHub, ctx: ToolContext): void {
     description: "Export parts to a file inside the project: step (named, coloured parts), stl, 3mf (named meshes with colours, for slicers), glb or brep. Placements are applied.",
     inputSchema: {
       type: "object",
-      properties: { format: { type: "string", enum: ["step", "stl", "3mf", "glb", "brep"] }, path: { type: "string", description: "Project-relative output path" }, ids: { type: "array", items: { type: "string" } } },
+      properties: {
+        format: { type: "string", enum: ["step", "stl", "3mf", "glb", "brep"] }, path: { type: "string", description: "Project-relative output path" }, ids: { type: "array", items: { type: "string" } },
+        allow_stale: { type: "boolean", description: "Export the last good geometry of a source whose current build fails (refused by default). Say so to the user." },
+      },
       required: ["format", "path"],
     },
     async run(a) {
       const p = need();
       const abs = p.abs(a.path);
-      const r = await ctx.worker.request("export", { format: a.format, path: abs, ids: a.ids ?? null }, 600000);
-      return text(`Exported ${r.parts} part(s) to ${relative(p.dir, r.path)} (${(r.bytes / 1e6).toFixed(2)} MB).`);
+      const r = await ctx.worker.request("export", { format: a.format, path: abs, ids: a.ids ?? null, allow_stale: a.allow_stale === true }, 600000);
+      const notes: string[] = [];
+      if (r.stale_sources?.length) notes.push(`OLD GEOMETRY: ${r.stale_sources.join(", ")} failed to build; this is its last good build, not the current file.`);
+      if (r.preview) notes.push(`POSE PREVIEW: exported with ${JSON.stringify(r.preview)} instead of the file's values.`);
+      return text([`Exported ${r.parts} part(s) to ${relative(p.dir, r.path)} (${(r.bytes / 1e6).toFixed(2)} MB).`, ...notes].join("\n"));
     },
   });
 
@@ -236,6 +242,7 @@ export function registerTools(hub: McpHub, ctx: ToolContext): void {
     async run() {
       const p = need();
       const d = readDesign(p);
+      if (d.error) return text(`PROBLEM: ${d.error}\n${d.rules.map((r) => `- [${r.id}] ${describeRule(r)}`).join("\n")}`, !!d.unreadable);
       if (!d.rules.length) return text(`No rules yet (${RULES_FILE} is missing or empty). The interference check runs anyway with check_design.`);
       const lines = d.rules.map((r) => `- [${r.id}] ${describeRule(r)}${r.note ? ` – ${r.note}` : ""}${r.by ? ` (by ${r.by})` : ""}`);
       if (d.materials) lines.push(`Project materials: ${JSON.stringify(d.materials)}`);

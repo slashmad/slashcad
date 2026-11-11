@@ -31,7 +31,7 @@ the agents' own traffic to their providers.
 └──────────────┴──────────────────────────────────────┴─────────────────────┘
 ```
 
-> **Status:** early development (0.5). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
+> **Status:** early development (0.5.1). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
 > Code. ChatGPT (Codex) runs real turns in the app. Its approval of SlashCAD's CAD tools was fixed in
 > 0.4 and has not yet been checked in a live session. The design checks of 0.5 are tested in the app
 > and through the MCP tools, but not yet in a real agent session. The Windows installer works; the portable exe
@@ -195,11 +195,16 @@ The **Checks** tab has four parts. Agents use the same checks through their tool
   - *outer envelope*;
   - *protected parts*, whose geometry must not change.
 
-  The rules and an all-pairs interference check run after every build. Click a result to highlight
+  When the project has a rules file and at most 150 parts, the rules and an all-pairs interference
+  check run after every build; otherwise press *Run checks*. A check cut short by its time limit
+  is shown as incomplete, never as passed. Checks and exports refuse a source whose build fails
+  instead of silently using its last good geometry. Click a result to highlight
   the parts. Agents can propose rules; you confirm each one.
 - **Motion.** Pick a parameter that moves parts (for example `SLIDE = 0  # mm`) and a range.
   SlashCAD rebuilds the model at every step in memory, without changing the file, and reports the
-  poses with interference or failed rules and the closest pairs. Click a pose to see it in the view;
+  poses with interference or failed rules and the closest pairs. Only the listed poses are checked,
+  not the motion between them. The *free path* and *retained* rules do check the whole travel: they
+  advance by the exact distance to the nearest part and probe every contact. Click a pose to see it in the view;
   a banner shows that the view is a preview, with a button to go back to the file.
 - **Print.** For your printer (*Settings › Printing*: bed, nozzle, layer, overhang limit, the fit
   clearance your printer achieves):
@@ -230,7 +235,9 @@ rules file. STEP and 3MF exports carry part names, so slicers list the parts by 
 - **No stored credentials.** SlashCAD never reads the agents' credential files. Login is handled by
   the agents' own login flows.
 - **Scripts run only in folders you trust.** Python model scripts are executed by the CAD worker, so
-  a newly opened folder runs nothing until you click *Trust and build*. A new folder only offers
+  a newly opened folder runs nothing until you click *Trust and build*. Your decision is stored in
+  SlashCAD's own data folder, keyed by the folder's real path: a project you receive cannot mark
+  itself as trusted. A new folder only offers
   scripts that import build123d/CadQuery as models, and STEP files can always be viewed. Single files
   (*Open file…*) keep all their state in the app's data folder, so nothing is written next to them.
 - **Agents stay in the project.** They are told to work only inside the project folder. File edits
@@ -304,6 +311,8 @@ npm run dist:linux                               # AppImage, deb, rpm in release
 node scripts/setup-python.mjs --bundle --target win
 npm run dist:win                                 # NSIS installer, portable exe, zip
 ```
+
+`npm run test:checks` runs the regression tests for the design checks (synthetic geometry only).
 
 `npm run icon` copies the icon set from `build/SlashCAD-transparent-icons` to the places the build
 uses. `npm run notices` regenerates `THIRD-PARTY-NOTICES.md` after dependency changes.

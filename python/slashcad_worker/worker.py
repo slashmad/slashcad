@@ -37,6 +37,8 @@ class Worker:
         self.placements: dict = {}  # id -> column-major 4x4 matrix set by the user in the view
         self.last_build: dict = {}  # params of the last build (sources, dirs, quality) for sweeps
         self.materials: dict = checks.material_table(None)
+        self.stale_sources: set = set()  # sources whose last build failed: their parts are old geometry
+        self.overrides: dict = {}  # pose preview of the last build ({source: {NAME: value}})
 
     def _shape(self, part):
         """The part as placed by the user. Meshes stay in the source frame; the view applies the same matrix."""
@@ -66,6 +68,7 @@ class Worker:
         self.materials = checks.material_table(p.get("materials"))
         _context["materials"] = self.materials
         overrides = p.get("overrides") or {}  # {source: {NAME: value}}: a pose preview, never written to disk
+        self.overrides = overrides
         self.last_build = {k: p.get(k) for k in ("project_dir", "cache_dir", "sources", "quality")}
         t0 = time.perf_counter()
         out_parts, sources, new_parts = [], [], {}
@@ -90,6 +93,7 @@ class Worker:
                 })
         # Keep previous geometry for sources that failed, so the view does not go blank.
         failed = {s["source"] for s in sources if s["error"]}
+        self.stale_sources = failed
         for pid, part in self.parts.items():
             if part.source in failed and pid not in new_parts:
                 new_parts[pid] = part
@@ -106,6 +110,23 @@ class Worker:
     def cmd_set_placements(self, rid, p):
         self.placements = p.get("placements") or {}
         return {"placed": len(self.placements)}
+
+    def _fresh(self, parts, what: str, allow_stale: bool = False) -> None:
+        """Refuse to check or export the last good geometry of a source whose build failed."""
+        stale = sorted({pt.source for pt in parts if pt.source in self.stale_sources})
+        if stale and not allow_stale:
+            raise RuntimeError(f"{', '.join(stale)} has a build error, so its parts are the last good geometry, not the current file. "
+                               f"Fix the error first; {what} would otherwise describe old geometry.")
+
+    def _provenance(self, parts) -> dict:
+        out = {}
+        stale = sorted({pt.source for pt in parts if pt.source in self.stale_sources})
+        if stale:
+            out["stale_sources"] = stale
+        prev = {src: v for src, v in (self.overrides or {}).items() if any(pt.source == src for pt in parts)}
+        if prev:
+            out["preview"] = prev
+        return out
 
     def _select(self, ids):
         if not ids:
@@ -187,6 +208,7 @@ class Worker:
 
     def cmd_export(self, rid, p):
         parts = self._select(p.get("ids"))
+        self._fresh(parts, "the export", bool(p.get("allow_stale")))
         fmt = p.get("format", "step").lower()
         path = p["path"]
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -213,7 +235,7 @@ class Worker:
             mesher.write(path)
         else:
             raise ValueError(f"unknown format {fmt}")
-        return {"path": path, "bytes": os.path.getsize(path), "parts": len(parts)}
+        return {"path": path, "bytes": os.path.getsize(path), "parts": len(parts), **self._provenance(parts)}
 
     # ------------------------------------------------------------ design checks
     def _items(self, parts=None, extra_parts=None):
@@ -228,14 +250,21 @@ class Worker:
     def cmd_check_design(self, rid, p):
         ids = p.get("ids")
         parts = self._select(ids) if ids else list(self.parts.values())
+        self._fresh(parts, "the check")
         deadline = time.monotonic() + float(p.get("time_limit", 120))
-        return checks.evaluate(self._items(parts), p.get("rules") or [], float(p.get("near", 0.5)), deadline)
+        rep = checks.evaluate(self._items(parts), p.get("rules") or [], float(p.get("near", 0.5)), deadline)
+        rep.update(self._provenance(parts))
+        return rep
 
     def cmd_sweep(self, rid, p):
         """Rebuild the scripts that define parameter `param` at each value (in memory), then check
         clearances and the rules at every pose. The project files are not changed."""
         name = str(p["param"])
-        values = [float(v) for v in p["values"]][:400]
+        values = [float(v) for v in p["values"]]
+        if not values:
+            raise ValueError("no values to check")
+        if len(values) > 400:
+            raise ValueError(f"{len(values)} poses requested; at most 400 (use a larger step)")
         lb = self.last_build
         if not lb.get("sources"):
             raise RuntimeError("build the project first")
@@ -256,6 +285,7 @@ class Worker:
         rules = p.get("rules") or []
         near = float(p.get("near", 0.5))
         static = [pt for pt in self.parts.values() if pt.source not in scripts]
+        self._fresh(static, "the sweep")
         cache: dict = {}
         poses, pair_min = [], {}
         deadline = time.monotonic() + float(p.get("time_limit", 600))
@@ -277,9 +307,10 @@ class Worker:
             if rules:
                 rep = checks.evaluate(items, rules, near, deadline)
                 pairs = rep["pairs"]
+                skipped = rep["skipped_pairs"]
                 fails = [{"id": r["id"], "kind": r["kind"], "detail": r["detail"]} for r in rep["results"] if r["status"] == "fail"]
             else:
-                pairs, _ = checks.pair_report(items, near, None, cache, deadline)
+                pairs, skipped = checks.pair_report(items, near, None, cache, deadline)
                 fails = []
             inter = [x for x in pairs if x["kind"] == "interference" and not x.get("allowed_by")]
             for x in pairs:
@@ -291,18 +322,23 @@ class Worker:
                                      "min_distance_mm": x["distance_mm"], "max_overlap_mm3": x["overlap_mm3"], "at": v, "kind": x["kind"],
                                      "allowed_by": x.get("allowed_by")}
             poses.append({"value": v, "interferences": len(inter), "worst": inter[0] if inter else (pairs[0] if pairs else None),
-                          "rule_failures": fails, "errors": errors})
+                          "rule_failures": fails, "errors": errors, "skipped_pairs": skipped})
         worst_pairs = sorted(pair_min.values(), key=lambda r: r["score"])[:40]
         for r in worst_pairs:
             r.pop("score", None)
         bad = [x["value"] for x in poses if x["interferences"] or x["rule_failures"] or x["errors"]]
+        partial = [x["value"] for x in poses if x["skipped_pairs"]]
         return {"param": name, "scripts": scripts, "values": values, "poses_checked": len(poses), "poses": poses,
-                "closest_pairs": worst_pairs, "failing_poses": bad, "near_mm": near,
-                "seconds": round(time.perf_counter() - t0, 2), "complete": len(poses) == len(values)}
+                "closest_pairs": worst_pairs, "failing_poses": bad, "incomplete_poses": partial, "near_mm": near,
+                "requested": {"first": values[0], "last": values[-1], "count": len(values)},
+                "seconds": round(time.perf_counter() - t0, 2), "complete": len(poses) == len(values) and not partial,
+                "note": "Only the listed values are checked; motion between them is not."}
 
     def cmd_printability(self, rid, p):
         out = []
-        for part in self._select(p.get("ids")):
+        sel = self._select(p.get("ids"))
+        self._fresh(sel, "the printability check")
+        for part in sel:
             out.append(checks.printability(part, self._shape(part), float(p.get("overhang_deg", 45)), p.get("bed"), float(p.get("nozzle", 0.4))))
         return {"parts": out}
 
@@ -310,6 +346,7 @@ class Worker:
         """Analysis slicing with a PrusaSlicer-family CLI. The G-code stays in the cache (it is an
         analysis artefact for a generic profile, not a print file)."""
         part = self._select([p["id"]])[0]
+        self._fresh([part], "slicing")
         exe = p.get("slicer")
         if not exe or not shutil.which(exe) and not os.path.exists(exe):
             raise RuntimeError("no slicer found (PrusaSlicer or SuperSlicer); set its path in Settings > Printing")

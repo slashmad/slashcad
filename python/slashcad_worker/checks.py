@@ -237,6 +237,17 @@ def _moved(shape, vec):
     return shape.moved(bd.Location(bd.Vector(*vec)))
 
 
+def axis_name(v) -> str:
+    try:
+        a = [float(x) for x in v]
+        nz = [(x, i) for i, x in enumerate(a) if x != 0]
+        if len(nz) == 1:
+            return ("+" if nz[0][0] > 0 else "-") + "XYZ"[nz[0][1]]
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
 def _unit(v):
     v = np.array(v, dtype=float)
     n = np.linalg.norm(v)
@@ -245,22 +256,55 @@ def _unit(v):
     return v / n
 
 
-def travel_until_collision(shape, targets, direction, distance: float, step: float):
-    """Move `shape` along `direction` in steps; the first travel (mm) at which it overlaps a target,
-    or None if it stays free for the whole distance. Returns (travel, target_part_id)."""
+PENETRATION_PROBE = 0.01  # mm: a contact blocks the motion if this much further travel overlaps
+PENETRATION_TOL = 1e-5   # mm³
+
+
+def travel_until_collision(shape, targets, direction, distance: float, resolution: float):
+    """Conservative advancement along `direction`: the first travel (mm) at which `shape` would
+    penetrate a target, or None if it stays free for the whole distance.
+
+    Away from contact the step is the exact surface distance to the nearest target, so no obstacle
+    can be skipped (a translation by s changes every distance by at most s). In contact, a probe
+    of PENETRATION_PROBE mm decides whether the contact blocks the motion; contact that only slides
+    advances by `resolution`, which is the only place where a feature thinner than `resolution`
+    could be missed. Returns (travel, target_id, info)."""
     u = _unit(direction)
-    n = max(1, int(math.ceil(distance / max(step, 1e-3))))
-    for k in range(1, n + 1):
-        d = min(distance, k * step)
+    if not distance > 0:
+        raise ValueError("distance must be positive")
+    res = max(float(resolution), 1e-3)
+    d = 0.0
+    evals = 0
+    slid = False
+    tboxes = [(tp, ts, _box(ts)) for tp, ts in targets]
+    for _ in range(20000):
         moved = _moved(shape, u * d)
         mb = _box(moved)
-        for tp, ts in targets:
-            if _box_gap(mb, _box(ts)) > 0:
-                continue
-            v = overlap_volume(moved, ts)
-            if v is None or v > VOLUME_TOL:
-                return d, tp.id
-    return None, None
+        remaining = distance - d
+        reach = [(tp, ts, tb) for tp, ts, tb in tboxes if _box_gap(mb, tb) <= remaining + 1e-9]
+        if not reach:
+            return None, None, {"evaluations": evals, "sliding_contact": slid}
+        step = remaining
+        for tp, ts, tb in reach:
+            evals += 1
+            if _box_gap(mb, tb) <= 1e-9:
+                v = overlap_volume(moved, ts)
+                if v is None or v > VOLUME_TOL:
+                    return d, tp.id, {"evaluations": evals, "sliding_contact": slid, "at_start": d == 0}
+            g = fast_distance(moved, ts, remaining + 1.0)
+            if g <= 1e-6:
+                probe = _moved(shape, u * (d + min(PENETRATION_PROBE, remaining)))
+                v = overlap_volume(probe, ts)
+                if v is None or v > PENETRATION_TOL:
+                    return d + min(PENETRATION_PROBE, remaining), tp.id, {"evaluations": evals, "sliding_contact": slid, "at_start": d == 0}
+                slid = True
+                step = min(step, res)
+            else:
+                step = min(step, g)
+        if d >= distance - 1e-12:
+            return None, None, {"evaluations": evals, "sliding_contact": slid}
+        d = min(distance, d + max(step, 1e-4))
+    raise RuntimeError("motion check did not converge")
 
 
 # ---------------------------------------------------------------- rules
@@ -286,9 +330,10 @@ def evaluate(items, rules: list, near: float = 0.5, deadline=None) -> dict:
     results = []
     if interference_on:
         bad = [p for p in pairs if p["kind"] == "interference" and not p["allowed_by"]]
-        results.append({"id": "interference", "kind": "interference", "status": "fail" if bad else "pass",
-                        "detail": (f"{len(bad)} interfering pair(s)" if bad else "no unintended interference")
-                        + (f"; {skipped} pair(s) not checked (time limit)" if skipped else ""),
+        status = "fail" if bad else ("incomplete" if skipped else "pass")
+        results.append({"id": "interference", "kind": "interference", "status": status,
+                        "detail": (f"{len(bad)} interfering pair(s)" if bad else ("no interference among the checked pairs" if skipped else "no unintended interference"))
+                        + (f"; INCOMPLETE: {skipped} pair(s) not checked (time limit)" if skipped else ""),
                         "pairs": bad[:50], "parts": sorted({x for p in bad for x in (p["a"], p["b"])})[:100]})
     by_id = {p.id: (p, s) for p, s, _ in items}
     for r in rules:
@@ -344,10 +389,11 @@ def evaluate(items, rules: list, near: float = 0.5, deadline=None) -> dict:
                 fps = r.get("fingerprints") or {}
                 changed, missing = [], []
                 for pid, fp in fps.items():
-                    hit = next(((p, f) for p, _, f in items if p.id == pid), None)
+                    # Shape only: moving or turning the part in the view is not a change.
+                    hit = next((p for p, _, _ in items if p.id == pid), None)
                     if hit is None:
                         missing.append(pid)
-                    elif hit[1] != fp:
+                    elif hit.geom != fp:
                         changed.append(pid)
                 st = "fail" if changed or missing else "pass"
                 det = []
@@ -365,29 +411,36 @@ def evaluate(items, rules: list, near: float = 0.5, deadline=None) -> dict:
                     continue
                 dirs = r.get("directions") or ([r["direction"]] if r.get("direction") else [[0, 0, 1]])
                 dist = float(r.get("within" if kind == "retained" else "distance", 2.0 if kind == "retained" else 10.0))
-                step = float(r.get("step", min(0.25, dist / 8) if kind == "retained" else min(0.5, dist / 10)))
-                fails, notes = [], []
+                res = float(r.get("step", 0.05))
+                if not dist > 0 or not res > 0:
+                    raise ValueError("distance/within and step must be positive")
+                fails, notes, slid = [], [], False
                 for mp, ms in movers:
                     targets = [(p, s) for p, s in targets_all if p.id != mp.id]
                     for d in dirs:
-                        travel, hit = travel_until_collision(ms, targets, d, dist + (step if kind == "retained" else 0), step)
+                        dn = axis_name(d)
+                        travel, hit, info = travel_until_collision(ms, targets, d, dist + (PENETRATION_PROBE if kind == "retained" else 0), res)
+                        slid = slid or info.get("sliding_contact", False)
+                        start = " (already overlapping at the start pose)" if info.get("at_start") and travel is not None and travel <= PENETRATION_PROBE else ""
                         if kind == "retained":
                             if travel is None or travel > dist + 1e-9:
-                                fails.append(f"{mp.name} moves {dist} mm along {d} without being caught")
+                                fails.append(f"{mp.name} moves {dist} mm along {dn} without being caught")
                             else:
-                                notes.append(f"{mp.name} caught after {travel:.2f} mm along {d} by {hit.split('#')[-1]}")
+                                notes.append(f"{mp.name} caught after {travel:.3f} mm along {dn} by {hit.split('#')[-1]}{start}")
                         else:
                             if travel is not None:
-                                fails.append(f"{mp.name} hits {hit.split('#')[-1]} after {travel:.2f} mm along {d}")
+                                fails.append(f"{mp.name} hits {hit.split('#')[-1]} after {travel:.3f} mm along {dn}{start}")
                             else:
-                                notes.append(f"{mp.name} free for {dist} mm along {d}")
+                                notes.append(f"{mp.name} free for {dist} mm along {dn}")
+                method = (f"continuous check; sliding contact sampled every {res:g} mm" if slid else "continuous check")
                 results.append({"id": rid, "kind": kind, "status": "fail" if fails else "pass",
-                                "detail": "; ".join(fails or notes)[:600], "parts": [p.id for p, _ in movers], "rule": r})
+                                "detail": ("; ".join(fails or notes)[:560] + f" [{method}]"), "parts": [p.id for p, _ in movers], "rule": r})
         except Exception as e:  # noqa: BLE001
             results.append({"id": rid, "kind": kind, "status": "warn", "detail": f"could not evaluate: {type(e).__name__}: {e}", "rule": r})
     summary = {"fail": sum(r["status"] == "fail" for r in results), "warn": sum(r["status"] == "warn" for r in results),
-               "pass": sum(r["status"] == "pass" for r in results)}
+               "pass": sum(r["status"] == "pass" for r in results), "incomplete": sum(r["status"] == "incomplete" for r in results)}
     return {"results": results, "pairs": pairs[:200], "pair_count": len(pairs), "summary": summary,
+            "skipped_pairs": skipped, "complete": skipped == 0 and summary["incomplete"] == 0,
             "parts": len(items), "seconds": round(time.perf_counter() - t0, 3)}
 
 

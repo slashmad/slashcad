@@ -55,6 +55,9 @@ export function ViewerPane(p: Props) {
   }, [v]);
 
   const setTool = (t: NavTool) => { v?.setTool(t); setToolState(t); };
+  const exportAs = (f: string, ids?: string[]) => {
+    api.cad.export(f, ids).catch((e: any) => alert(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, "")));
+  };
   const toggleProjection = () => {
     if (!v) return;
     const next = v.projection === "perspective" ? "orthographic" : "perspective";
@@ -132,8 +135,8 @@ export function ViewerPane(p: Props) {
           <button onClick={() => setMenu(menu === "export" ? null : "export")}>{t("vp.export")}</button>
           {menu === "export" && (
             <div className="menu" onMouseLeave={() => setMenu(null)}>
-              {["step", "stl", "glb", "brep"].map((f) => <div key={f} className="menu-item" onClick={() => { setMenu(null); api.cad.export(f); }}>{t("vp.exportAll", { f: f.toUpperCase() })}</div>)}
-              {sel && ["step", "stl"].map((f) => <div key={"s" + f} className="menu-item" onClick={() => { setMenu(null); api.cad.export(f, [sel.partId]); }}>{t("vp.exportSel", { f: f.toUpperCase() })}</div>)}
+              {["step", "stl", "3mf", "glb", "brep"].map((f) => <div key={f} className="menu-item" onClick={() => { setMenu(null); exportAs(f); }}>{t("vp.exportAll", { f: f.toUpperCase() })}</div>)}
+              {sel && ["step", "stl", "3mf"].map((f) => <div key={"s" + f} className="menu-item" onClick={() => { setMenu(null); exportAs(f, [sel.partId]); }}>{t("vp.exportSel", { f: f.toUpperCase() })}</div>)}
             </div>
           )}
         </span>

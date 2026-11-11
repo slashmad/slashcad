@@ -24,13 +24,27 @@ export function testsPath(p: Project): string { return pathFor(p, TESTS_FILE); }
 export function hasRules(p: Project): boolean { return existsSync(rulesPath(p)); }
 
 export function readDesign(p: Project): DesignFile {
+  let text: string;
+  try { text = readFileSync(rulesPath(p), "utf8"); } catch { return { version: 1, rules: [] }; } // no rules file
   try {
-    const j = JSON.parse(readFileSync(rulesPath(p), "utf8"));
-    const rules = Array.isArray(j.rules) ? j.rules.filter((r: any) => r && KINDS.includes(r.kind)) : [];
-    return { version: 1, rules, materials: j.materials && typeof j.materials === "object" ? j.materials : undefined, sweep: j.sweep };
-  } catch {
-    return { version: 1, rules: [] };
+    const j = JSON.parse(text);
+    const all: any[] = Array.isArray(j.rules) ? j.rules : [];
+    const rules = all.filter((r) => r && KINDS.includes(r.kind));
+    const bad = all.filter((r) => !(r && KINDS.includes(r.kind)));
+    return {
+      version: 1, rules, materials: j.materials && typeof j.materials === "object" ? j.materials : undefined, sweep: j.sweep,
+      ...(bad.length ? { error: `${bad.length} rule(s) with an unknown kind were not checked: ${bad.map((r) => JSON.stringify(r?.kind ?? r)).slice(0, 5).join(", ")}` } : {}),
+    };
+  } catch (e: any) {
+    // A broken file must never read as "no rules": that would turn every check into a pass.
+    return { version: 1, rules: [], error: `${RULES_FILE} could not be read (${e?.message ?? e}); no rules were checked`, unreadable: true };
   }
+}
+
+function writable(p: Project): DesignFile {
+  const d = readDesign(p);
+  if (d.unreadable) throw new Error(`${d.error}. Fix the file by hand first; SlashCAD will not overwrite it.`);
+  return d;
 }
 
 function writeDesign(p: Project, d: DesignFile): void {
@@ -65,7 +79,7 @@ export function normaliseRule(r: any, existing: DesignRule[]): DesignRule {
 }
 
 export function addRule(p: Project, rule: any): DesignRule {
-  const d = readDesign(p);
+  const d = writable(p);
   const r = normaliseRule(rule, d.rules);
   d.rules.push(r);
   writeDesign(p, d);
@@ -73,7 +87,7 @@ export function addRule(p: Project, rule: any): DesignRule {
 }
 
 export function removeRule(p: Project, id: string): boolean {
-  const d = readDesign(p);
+  const d = writable(p);
   const n = d.rules.length;
   d.rules = d.rules.filter((r) => r.id !== id);
   if (d.rules.length === n) return false;
@@ -82,7 +96,7 @@ export function removeRule(p: Project, id: string): boolean {
 }
 
 export function setSweep(p: Project, sweep: DesignFile["sweep"]): void {
-  const d = readDesign(p);
+  const d = writable(p);
   d.sweep = sweep;
   writeDesign(p, d);
 }

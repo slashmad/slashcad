@@ -5,6 +5,8 @@ import { createContext, useContext } from "react";
 export type Lang = "en" | "sv";
 
 const sv: Record<string, string> = {
+  "chk.incompleteRun": "OFULLSTÄNDIG: alla par kontrollerades inte",
+  "chk.sampledNote": "Bara dessa lägen kontrolleras, inte rörelsen mellan dem: välj ett steg mindre än den tunnaste detalj som kan haka i.",
   "left.checks": "Kontroller",
   "chk.tabFails": "{n} underkända konstruktionskontroller",
   "chk.rules": "Regler",
@@ -30,7 +32,7 @@ const sv: Record<string, string> = {
   "chk.removeRule": "Ta bort regeln",
   "chk.addRule": "Lägg till regel…",
   "chk.protect": "Skydda markerad",
-  "chk.protectTitle": "Lås den markerade delens geometri: kontrollen blir underkänd om den ändras senare",
+  "chk.protectTitle": "Lås den markerade delens form: kontrollen blir underkänd om formen ändras senare (att flytta den i vyn är tillåtet)",
   "chk.kind.clearance": "Frigång mellan delar",
   "chk.kind.allow_contact": "Avsiktlig kontakt (tillåten överlapp)",
   "chk.kind.retained": "Fasthållen (ska fångas)",
@@ -67,7 +69,7 @@ const sv: Record<string, string> = {
   "chk.preview": "Visa läge",
   "chk.backToFile": "Tillbaka till filen",
   "chk.sweepSummary": "{n}/{total} lägen av {p} på {s} s",
-  "chk.incomplete": "(stoppad av tidsgränsen)",
+  "chk.incomplete": "(ofullständig: stoppad av tidsgränsen)",
   "chk.failingPoses": "Underkända lägen",
   "chk.clickPose": "Klicka för att visa läget",
   "chk.closestSweep": "Närmaste par under rörelsen",
@@ -401,6 +403,8 @@ const sv: Record<string, string> = {
 const tables: Record<Lang, Record<string, string>> = { en: {}, sv };
 
 const en: Record<string, string> = {
+  "chk.incompleteRun": "INCOMPLETE: not every pair was checked",
+  "chk.sampledNote": "Only these poses are checked, not the motion between them: use a step smaller than the thinnest feature that could catch.",
   "left.checks": "Checks",
   "chk.tabFails": "{n} failed design check(s)",
   "chk.rules": "Rules",
@@ -426,7 +430,7 @@ const en: Record<string, string> = {
   "chk.removeRule": "Remove the rule",
   "chk.addRule": "Add a rule…",
   "chk.protect": "Protect selected",
-  "chk.protectTitle": "Freeze the selected part's geometry: the check fails if it changes later",
+  "chk.protectTitle": "Freeze the selected part's shape: the check fails if the shape changes later (moving it in the view is allowed)",
   "chk.kind.clearance": "Clearance between parts",
   "chk.kind.allow_contact": "Intended contact (allowed overlap)",
   "chk.kind.retained": "Retained (must be caught)",
@@ -463,7 +467,7 @@ const en: Record<string, string> = {
   "chk.preview": "Show pose",
   "chk.backToFile": "Back to file",
   "chk.sweepSummary": "{n}/{total} poses of {p} in {s} s",
-  "chk.incomplete": "(stopped by the time limit)",
+  "chk.incomplete": "(incomplete: stopped by the time limit)",
   "chk.failingPoses": "Failing poses",
   "chk.clickPose": "Click to show this pose",
   "chk.closestSweep": "Closest pairs over the sweep",

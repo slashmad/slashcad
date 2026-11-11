@@ -16,6 +16,8 @@ export class Builder extends EventEmitter {
   last: BuildResult | null = null;
   state: BuildState = { running: false, workerReady: false };
   private n = 0;
+  /** Bumped by reset (project switch): a build started before it is not reported. */
+  private gen = 0;
   /** A parameter value shown in the view without touching the file (motion study preview). */
   preview: PosePreview | null = null;
 
@@ -43,6 +45,7 @@ export class Builder extends EventEmitter {
   private async run(trigger: string): Promise<BuildResult> {
     const project = this.project();
     if (!project) throw new Error("no project is open");
+    const gen = this.gen;
     const startedAt = Date.now();
     this.setState({ running: true, message: "Building…", queued: false });
     this.emit("start", { trigger });
@@ -71,6 +74,14 @@ export class Builder extends EventEmitter {
     this.running = p;
     const result = await p;
     this.running = null;
+    if (gen !== this.gen) {
+      // The project changed while this build ran: never show or keep its parts.
+      this.setState({ running: false, message: undefined });
+      const waiters = this.waiters.splice(0);
+      waiters.forEach((w) => w(result));
+      if (this.queuedTrigger) { const t = this.queuedTrigger; this.queuedTrigger = null; this.run(t).catch(() => {}); }
+      return result;
+    }
     this.last = result;
     this.history.push(result);
     if (this.history.length > 100) this.history.shift();
@@ -90,6 +101,7 @@ export class Builder extends EventEmitter {
   }
 
   reset(): void {
+    this.gen++;
     this.preview = null;
     this.history = [];
     this.last = null;

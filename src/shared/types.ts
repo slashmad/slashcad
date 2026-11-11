@@ -221,12 +221,15 @@ export interface DesignFile {
   materials?: Record<string, { density?: number; color?: string; label?: string }>;
   /** Default motion study: the parameter and range used by "Run sweep". */
   sweep?: { param: string; from: number; to: number; step: number; file?: string };
+  /** Set when the file could not be read completely: shown and counted as a failure. */
+  error?: string;
+  unreadable?: boolean;
 }
 
 export interface RuleResult {
   id: string;
   kind: string;
-  status: "pass" | "fail" | "warn";
+  status: "pass" | "fail" | "warn" | "incomplete";
   detail: string;
   parts?: string[];
   pairs?: PairResult[];
@@ -250,7 +253,11 @@ export interface DesignReport {
   results: RuleResult[];
   pairs: PairResult[];
   pair_count: number;
-  summary: { fail: number; warn: number; pass: number };
+  summary: { fail: number; warn: number; pass: number; incomplete?: number };
+  complete?: boolean; // false when the time limit left pairs unchecked
+  skipped_pairs?: number;
+  stale_sources?: string[];
+  preview?: Record<string, Record<string, number>>;
   parts: number;
   seconds: number;
   error?: string;
@@ -263,6 +270,7 @@ export interface SweepPose {
   worst: PairResult | null;
   rule_failures: { id: string; kind: string; detail: string }[];
   errors: string[];
+  skipped_pairs?: number;
 }
 
 export interface SweepResult {
@@ -273,6 +281,7 @@ export interface SweepResult {
   poses: SweepPose[];
   closest_pairs: (Omit<PairResult, "distance_mm" | "overlap_mm3"> & { min_distance_mm: number; max_overlap_mm3: number | null; at: number })[];
   failing_poses: number[];
+  incomplete_poses?: number[];
   near_mm: number;
   seconds: number;
   complete: boolean;
@@ -294,6 +303,7 @@ export interface PrintReport {
   hints?: string[];
   error?: string;
   slice?: SliceResult[];
+  key?: string; // placement and printer settings the result was computed for
 }
 
 export interface SliceResult {

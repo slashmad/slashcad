@@ -278,7 +278,7 @@ function openProject(dir: string, opts: ProjectOptions = {}): void {
   history = new History(project);
   history.on("state", (st) => send("history:state", st));
   history.on("applied", (a: { scene: boolean }) => { if (a.scene) builder.request("scene").catch(() => {}); });
-  project.on("placement-changed", () => pushPlacements());
+  project.on("placement-changed", () => { pushPlacements(); checks.invalidatePrints(); });
   annotations?.removeAllListeners();
   annotations = new Annotations(project.stateDir);
   annotations.on("changed", (list) => send("annotations:changed", list));
@@ -361,7 +361,7 @@ print("reference size (mm):", round(bb.size.X, 2), round(bb.size.Y, 2), round(bb
   }
   mkdirSync(join(dir, ".slashcad"), { recursive: true });
   const scene = model.toLowerCase().endsWith(".py") ? [model] : [model, "main.py"];
-  writeFileSync(join(dir, ".slashcad", "project.json"), JSON.stringify({ scene, quality: project.info.quality, trusted: true }, null, 2));
+  writeFileSync(join(dir, ".slashcad", "project.json"), JSON.stringify({ scene, quality: project.info.quality }, null, 2));
   await openPath(dir, { trusted: true });
   return true;
 }
@@ -436,6 +436,7 @@ function registerIpc(): void {
   ipcMain.handle("settings:set", (_e, patch) => {
     const r = setSettings(patch);
     if ("solidcraftCliPath" in patch || "solidcraftAppPath" in patch) solidcraftInfo(true);
+    checks.invalidatePrints(); // printer settings are part of each printability result
     return r;
   });
   ipcMain.handle("solidcraft:info", () => solidcraftInfo());
@@ -525,6 +526,9 @@ function registerIpc(): void {
   ipcMain.handle("cad:inspect", (_e, ids?: string[]) => worker.request("inspect", { ids: ids ?? null }));
   ipcMain.handle("cad:export", async (_e, format: string, ids?: string[]) => {
     if (!project) return null;
+    const pv = builder.preview;
+    if (pv && !(await confirmBox({ type: "question", buttons: ["Export the preview", "Cancel"], defaultId: 1, cancelId: 1,
+      message: `The view shows a preview: ${pv.param} = ${pv.value}`, detail: `The file says otherwise (${pv.file}). Export the previewed pose anyway?` }))) return null;
     const r = await dialog.showSaveDialog(win!, { defaultPath: join(project.dir, `export.${format}`), filters: [{ name: format.toUpperCase(), extensions: [format] }] });
     if (r.canceled || !r.filePath) return null;
     return worker.request("export", { format, path: r.filePath, ids: ids ?? null }, 600000);

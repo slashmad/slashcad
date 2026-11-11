@@ -5,14 +5,16 @@
 //   scene) lives in the app's data folder so nothing is written next to the file (e.g. Downloads).
 //
 // Safety: Python scripts run in the CAD worker, so a folder's scripts never run until the user
-// trusts the folder (`trusted` in project.json). New folders get no scripts in the scene unless
-// they are recognisable CAD scripts and the user agrees.
+// trusts the folder. That decision is stored by the app (trust.ts, keyed by the real path), never
+// in the project: a `trusted` flag in a received project.json is ignored. New folders get no
+// scripts in the scene unless they are recognisable CAD scripts and the user agrees.
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync, type FSWatcher } from "node:fs";
 import { basename, dirname, join, relative, sep } from "node:path";
 import type { FileDiff, FileNode, ProjectInfo } from "../shared/types";
 import { makeDiff } from "./diff";
+import { isTrusted, setTrusted as storeTrust } from "./trust";
 
 const IGNORE = new Set([".git", ".slashcad", ".slashmad", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache", "dist", "release"]);
 export const CAD_EXT = [".py", ".step", ".stp", ".brep", ".sc"];
@@ -89,7 +91,6 @@ export class Project extends EventEmitter {
       isNew = false;
       scene = Array.isArray(j.scene) ? j.scene : null;
       if (j.quality) quality = j.quality;
-      trusted = j.trusted === true;
       if (j.placements && typeof j.placements === "object") {
         for (const [id, m] of Object.entries(j.placements)) {
           if (Array.isArray(m) && m.length === 16 && m.every((x) => typeof x === "number" && Number.isFinite(x))) placements[id] = m as number[];
@@ -98,7 +99,9 @@ export class Project extends EventEmitter {
     } catch { /* new project */ }
     if (this.singleFile) scene = [this.singleFile];
     if (!scene) scene = this.defaultScene();
-    if (forceTrusted) trusted = true;
+    // Execution trust comes only from the app's own store (or an app-created project).
+    trusted = isTrusted(this.trustPath);
+    if (forceTrusted) { trusted = true; storeTrust(this.trustPath, true); }
     return {
       dir: this.dir, name: this.singleFile ?? basename(this.dir), scene, quality, trusted, isNew,
       singleFile: this.singleFile ?? undefined, scripts: this.scriptsIn(scene), placements,
@@ -122,7 +125,13 @@ export class Project extends EventEmitter {
     return this.info.scene.filter((s) => this.info.trusted || !s.toLowerCase().endsWith(".py"));
   }
 
+  /** What the trust decision applies to: the folder, or the single opened file. */
+  get trustPath(): string {
+    return this.singleFile ? join(this.dir, this.singleFile) : this.dir;
+  }
+
   setTrusted(v: boolean): void {
+    storeTrust(this.trustPath, v);
     this.info.trusted = v;
     this.saveInfo();
   }
@@ -130,7 +139,7 @@ export class Project extends EventEmitter {
   saveInfo(): void {
     this.info.scripts = this.scriptsIn(this.info.scene);
     this.info.isNew = false;
-    writeFileSync(join(this.stateDir, "project.json"), JSON.stringify({ scene: this.info.scene, quality: this.info.quality, trusted: this.info.trusted, placements: this.info.placements ?? {} }, null, 2));
+    writeFileSync(join(this.stateDir, "project.json"), JSON.stringify({ scene: this.info.scene, quality: this.info.quality, placements: this.info.placements ?? {} }, null, 2));
     this.emit("info", this.info);
   }
 
