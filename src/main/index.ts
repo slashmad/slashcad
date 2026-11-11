@@ -2,7 +2,7 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
-import type { AgentEvent, AgentKind, PermissionDecision, SnapshotRequest } from "../shared/types";
+import type { AgentEvent, AgentKind, PermissionDecision, PosePreview, SnapshotRequest } from "../shared/types";
 import { AgentSession } from "./agents/base";
 import { claudeAuthStatus, claudeLogin, codexAuthStatus, codexLogin, writeLoginInput } from "./agents/auth";
 import { pickBinary } from "./agents/binaries";
@@ -11,6 +11,8 @@ import { CodexSession, listCodexSessions } from "./agents/codex";
 import { Annotations } from "./annotations";
 import { Builder } from "./builder";
 import { CadWorker } from "./cadWorker";
+import { DesignChecks, findSlicer } from "./checks";
+import { addRule, addTest, readDesign, readTests, removeRule, removeTest, RULES_FILE, setSweep, TESTS_FILE, updateTest } from "./design";
 import { integrateDesktop } from "./desktopIntegration";
 import { downloadReference } from "./download";
 import { History, type Op } from "./history";
@@ -92,6 +94,7 @@ let annotations: Annotations | null = null;
 let history: History | null = null;
 const worker = new CadWorker();
 const builder = new Builder(worker, () => project);
+const checks = new DesignChecks(worker, builder, () => project);
 const hub = new McpHub(app.getPath("userData"), process.env.SLASHCAD_USER_DATA ? "test" : "");
 let agent: AgentSession | null = null;
 const snapshotWaiters = new Map<string, { resolve: (u: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
@@ -175,6 +178,11 @@ function freeName(p: Project, rel: string): string {
 function importFolderFor(name: string): string {
   const lower = name.toLowerCase();
   return MODEL_EXT.some((e) => lower.endsWith(e)) || lower.endsWith(".py") ? "" : "references";
+}
+
+function needProject(): Project {
+  if (!project) throw new Error("No project is open.");
+  return project;
 }
 
 function needFolderProject(): Project {
@@ -265,6 +273,7 @@ function openProject(dir: string, opts: ProjectOptions = {}): void {
   history?.removeAllListeners();
   stopAgent();
   builder.reset();
+  checks.reset();
   project = new Project(dir, opts);
   history = new History(project);
   history.on("state", (st) => send("history:state", st));
@@ -278,6 +287,8 @@ function openProject(dir: string, opts: ProjectOptions = {}): void {
     send("project:changed", { files, diffs, tree: project!.tree() });
     if (files.some((f: string) => f.endsWith(".py"))) send("params:changed", readParams(project!));
     if (project!.touchesScene(files)) builder.request("file").catch(() => {});
+    // The user's rules and test log: hand edits show up at once and the rules are re-checked.
+    if (files.includes(RULES_FILE) || files.includes(TESTS_FILE)) designChanged(files.includes(RULES_FILE));
   });
   project.on("info", (info) => { send("project:info", info); send("params:changed", readParams(project!)); });
   project.startWatching();
@@ -285,6 +296,20 @@ function openProject(dir: string, opts: ProjectOptions = {}): void {
   send("history:state", history.state());
   send("annotations:changed", annotations.list());
   send("params:changed", readParams(project));
+}
+
+/** Rules or test log changed (any writer): refresh the panels; re-check rules on the current build. */
+function designChanged(rules = true): void {
+  if (!project) return;
+  send("design:changed", readDesign(project));
+  send("tests:changed", readTests(project));
+  if (rules && builder.last) checks.run().catch(() => {});
+}
+
+/** Pose preview: show a parameter value without writing the file (motion study). */
+function setPreview(p: PosePreview | null) {
+  builder.preview = p;
+  return builder.request(p ? `preview ${p.param}=${p.value}` : "preview cleared");
 }
 
 function createProject(dir: string): void {
@@ -504,6 +529,33 @@ function registerIpc(): void {
     if (r.canceled || !r.filePath) return null;
     return worker.request("export", { format, path: r.filePath, ids: ids ?? null }, 600000);
   });
+  ipcMain.handle("checks:report", () => checks.report);
+  ipcMain.handle("checks:sweep", () => checks.sweep);
+  ipcMain.handle("checks:prints", () => Array.from(checks.prints.values()));
+  ipcMain.handle("checks:run", (_e, ids?: string[]) => checks.run(ids));
+  ipcMain.handle("checks:sweep:run", (_e, opts) => checks.runSweep(opts));
+  ipcMain.handle("checks:printability", (_e, ids?: string[]) => checks.printability(ids));
+  ipcMain.handle("checks:slice", (_e, id: string, support: boolean) => checks.slice(id, support));
+  ipcMain.handle("checks:slicer", () => findSlicer());
+  ipcMain.handle("checks:preview", (_e, p: PosePreview | null) => setPreview(p));
+  ipcMain.handle("design:get", () => (project ? readDesign(project) : null));
+  ipcMain.handle("design:addRule", (_e, rule) => { const r = addRule(needProject(), { ...rule, by: "user" }); designChanged(); return r; });
+  ipcMain.handle("design:removeRule", (_e, id: string) => { const ok = removeRule(needProject(), id); designChanged(); return ok; });
+  ipcMain.handle("design:setSweep", (_e, sweep) => { setSweep(needProject(), sweep); designChanged(false); return true; });
+  // Protect the current geometry of parts: later builds fail the check if any of them changes.
+  ipcMain.handle("design:protect", (_e, ids: string[], note?: string) => {
+    const p = needProject();
+    const parts = (builder.last?.parts ?? []).filter((x) => ids.includes(x.id) && x.geom && !x.stale);
+    if (!parts.length) throw new Error("build the parts first");
+    const fingerprints = Object.fromEntries(parts.map((x) => [x.id, x.geom!]));
+    const r = addRule(p, { kind: "protected", fingerprints, note: note || `protected ${parts.length} part(s)`, by: "user" });
+    designChanged();
+    return r;
+  });
+  ipcMain.handle("tests:list", () => (project ? readTests(project) : []));
+  ipcMain.handle("tests:add", (_e, t) => { const r = addTest(needProject(), t, "user"); designChanged(false); return r; });
+  ipcMain.handle("tests:update", (_e, id: string, patch) => { const r = updateTest(needProject(), id, patch); designChanged(false); return r; });
+  ipcMain.handle("tests:remove", (_e, id: string) => { const r = removeTest(needProject(), id); designChanged(false); return r; });
 
   ipcMain.handle("agent:start", (_e, kind: AgentKind, resumeId?: string) => startAgent(kind, resumeId));
   ipcMain.handle("agent:send", async (_e, text: string) => {
@@ -570,6 +622,19 @@ app.whenReady().then(async () => {
     highlight: (ids, message) => send("viewer:highlight", { ids, message }),
     sceneChanged: () => project && send("project:info", project.info),
     fetchReference: (url, filename, folder) => fetchReference(url, filename, folder, agent?.kind === "codex" ? "ChatGPT (Codex)" : "Claude"),
+    checks,
+    confirm: (message: string, detail: string, yes: string) =>
+      confirmBox({
+        type: "question",
+        buttons: [yes, "Cancel"],
+        defaultId: 0,
+        cancelId: 1,
+        message,
+        detail,
+      }),
+    agentName: () => (agent?.kind === "codex" ? "ChatGPT (Codex)" : "Claude"),
+    setPreview,
+    designChanged: () => designChanged(false),
   });
   // The CAD tools for agents must never keep the window from opening.
   try { await hub.start(); } catch (e) { console.error("MCP hub:", e); }
@@ -583,6 +648,10 @@ app.whenReady().then(async () => {
     project?.on("changed", () => {});
   }
   builder.on("result", (r) => send("cad:result", r));
+  checks.on("report", (rep) => send("checks:report", rep));
+  checks.on("sweep", (sw) => send("checks:sweep", sw));
+  checks.on("prints", (pr) => send("checks:prints", pr));
+  checks.on("running", (k) => send("checks:running", k));
   // Test hook: SLASHCAD_SCREENSHOT=<png> captures the window a few seconds after the first build.
   const shot = process.env.SLASHCAD_SCREENSHOT;
   if (shot) {
@@ -596,6 +665,17 @@ app.whenReady().then(async () => {
           console.log("[test] selected", JSON.stringify(sel));
           if (sel && sel.face >= 0) console.log("[test] face_info", JSON.stringify(await worker.request("face_info", { id: sel.partId, face: sel.face })));
           await new Promise((r) => setTimeout(r, 1500));
+        }
+        // SLASHCAD_TEST_TOOLS=name[:base64-json],…: call MCP tools as an agent would and log the text.
+        if (process.env.SLASHCAD_TEST_TOOLS && process.env.SLASHCAD_USER_DATA) {
+          for (const spec of process.env.SLASHCAD_TEST_TOOLS.split(",")) {
+            const [name, b64] = spec.split(":");
+            const args = b64 ? JSON.parse(Buffer.from(b64, "base64").toString("utf8")) : {};
+            try {
+              const r = await hub.call(name, args);
+              console.log(`[tool] ${name}${r.isError ? " (error)" : ""}\n${r.content.map((c) => (c.type === "text" ? c.text : `<${c.type}>`)).join("\n")}`);
+            } catch (e: any) { console.log(`[tool] ${name} threw ${e?.message ?? e}`); }
+          }
         }
         // SLASHCAD_TEST_SCRIPT=<file.js>: an async function body run in the window; its result is logged.
         if (process.env.SLASHCAD_TEST_SCRIPT && process.env.SLASHCAD_USER_DATA) {

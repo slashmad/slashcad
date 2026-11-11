@@ -1,7 +1,9 @@
-import { useMemo, useRef, useState } from "react";
-import type { BuildResult, FileDiff, FileNode, Param, PartInfo, ProjectInfo } from "../../shared/types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { BuildResult, DesignReport, FileDiff, FileNode, Param, PartInfo, ProjectInfo, Settings } from "../../shared/types";
 import { api, fmtTime } from "../api";
 import { ParamsPanel } from "./ParamsPanel";
+import { ChecksPanel } from "./ChecksPanel";
+import type { Viewer } from "../viewer/Viewer";
 import { useT } from "../i18n";
 
 const CAD = [".py", ".step", ".stp", ".brep", ".sc"];
@@ -24,6 +26,9 @@ interface Props {
   onShowAll(): void;
   onImport(destDir?: string, paths?: string[]): void;
   onDelete(paths: string[]): void;
+  viewer: Viewer | null;
+  settings: Settings | null;
+  onOpenSettings(): void;
 }
 
 interface TreeSel {
@@ -222,13 +227,17 @@ function Files(p: Props) {
 
 export function LeftPanel(p: Props) {
   const t = useT();
-  const [tab, setTab] = useState<"files" | "model" | "params" | "diffs" | "hist">("files");
+  const [tab, setTab] = useState<"files" | "model" | "params" | "checks" | "diffs" | "hist">("files");
+  const [report, setReport] = useState<DesignReport | null>(null);
+  useEffect(() => { api.checks.report().then(setReport); const off = api.checks.onReport(setReport); return () => { off(); }; }, []);
+  const fails = report?.summary.fail ?? 0;
   return (
     <div className="left-panel">
       <div className="tabs">
         <button className={tab === "files" ? "on" : ""} onClick={() => setTab("files")}>{t("left.files")}</button>
         <button className={tab === "model" ? "on" : ""} onClick={() => setTab("model")}>{t("left.model")}</button>
         <button className={tab === "params" ? "on" : ""} onClick={() => setTab("params")}>{t("left.params")}</button>
+        <button className={`${tab === "checks" ? "on" : ""} ${fails ? "bad" : ""}`} title={fails ? t("chk.tabFails", { n: fails }) : undefined} onClick={() => setTab("checks")}>{t("left.checks")}{fails ? ` ${fails}` : ""}</button>
         <button className={tab === "diffs" ? "on" : ""} onClick={() => setTab("diffs")} >{t("left.diffs")}{p.diffs.length ? ` ${p.diffs.length}` : ""}</button>
         <button className={tab === "hist" ? "on" : ""} onClick={() => setTab("hist")}>{t("left.builds")}</button>
       </div>
@@ -236,6 +245,7 @@ export function LeftPanel(p: Props) {
         {tab === "files" && <Files {...p} />}
         {tab === "model" && <ModelTree {...p} />}
         {tab === "params" && <ParamsPanel params={p.params} />}
+        {tab === "checks" && <ChecksPanel build={p.build} params={p.params} selectedPart={p.selectedPart} viewer={p.viewer} settings={p.settings} onOpenSettings={p.onOpenSettings} />}
         {tab === "diffs" && <Diffs diffs={p.diffs} onOpen={p.onOpenFile} />}
         {tab === "hist" && <History history={p.history} />}
       </div>

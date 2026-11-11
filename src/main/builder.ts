@@ -2,8 +2,9 @@
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
 import { join } from "node:path";
-import type { BuildResult, BuildState } from "../shared/types";
+import type { BuildResult, BuildState, PosePreview } from "../shared/types";
 import type { CadWorker } from "./cadWorker";
+import { readDesign } from "./design";
 import type { Project } from "./project";
 import { getSettings } from "./settings";
 
@@ -15,6 +16,8 @@ export class Builder extends EventEmitter {
   last: BuildResult | null = null;
   state: BuildState = { running: false, workerReady: false };
   private n = 0;
+  /** A parameter value shown in the view without touching the file (motion study preview). */
+  preview: PosePreview | null = null;
 
   constructor(private worker: CadWorker, private project: () => Project | null) {
     super();
@@ -51,8 +54,10 @@ export class Builder extends EventEmitter {
           sources: project.buildableScene(),
           quality: project.info.quality,
           placements: project.info.placements ?? {},
+          materials: readDesign(project).materials ?? {},
+          overrides: this.preview ? { [this.preview.file]: { [this.preview.param]: this.preview.value } } : {},
         }, getSettings().buildTimeoutSec * 1000);
-        const result: BuildResult = { n: ++this.n, trigger, startedAt, ...res };
+        const result: BuildResult = { n: ++this.n, trigger, startedAt, ...res, preview: this.preview };
         return result;
       } catch (e: any) {
         const result: BuildResult = {
@@ -85,6 +90,7 @@ export class Builder extends EventEmitter {
   }
 
   reset(): void {
+    this.preview = null;
     this.history = [];
     this.last = null;
     this.n = 0;

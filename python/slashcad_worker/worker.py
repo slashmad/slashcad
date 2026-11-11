@@ -1,13 +1,19 @@
 """Command handlers. State lives here between builds: last parts, keys and shapes."""
 from __future__ import annotations
 
+import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import build123d as bd
 
+from . import checks
 from .mesh import tessellate, write_smsh
-from .sources import SUPPORTED, load_source
+from .sources import SUPPORTED, _context, load_source
 
 
 def _location(m) -> bd.Location:
@@ -29,6 +35,8 @@ class Worker:
         self.parts: dict = {}      # id -> Part (last successful build)
         self.prev_keys: dict = {}  # id -> mesh key
         self.placements: dict = {}  # id -> column-major 4x4 matrix set by the user in the view
+        self.last_build: dict = {}  # params of the last build (sources, dirs, quality) for sweeps
+        self.materials: dict = checks.material_table(None)
 
     def _shape(self, part):
         """The part as placed by the user. Meshes stay in the source frame; the view applies the same matrix."""
@@ -55,12 +63,16 @@ class Worker:
         progress = self._progress(rid)
         if "placements" in p:
             self.placements = p.get("placements") or {}
+        self.materials = checks.material_table(p.get("materials"))
+        _context["materials"] = self.materials
+        overrides = p.get("overrides") or {}  # {source: {NAME: value}}: a pose preview, never written to disk
+        self.last_build = {k: p.get(k) for k in ("project_dir", "cache_dir", "sources", "quality")}
         t0 = time.perf_counter()
         out_parts, sources, new_parts = [], [], {}
         for rel in p.get("sources", []):
             if not rel.lower().endswith(SUPPORTED):
                 continue
-            res = load_source(rel, project_dir, cache_dir, quality, progress)
+            res = load_source(rel, project_dir, cache_dir, quality, progress, overrides.get(rel))
             sources.append({"source": rel, "log": res.log[-20000:], "error": res.error, "seconds": round(res.seconds, 3),
                             "parts": len(res.parts)})
             for i, part in enumerate(res.parts):
@@ -74,7 +86,7 @@ class Worker:
                 out_parts.append({
                     "id": part.id, "name": part.name, "source": part.source, "key": part.key,
                     "color": part.color, "mesh": mesh_path, "bbox": _bbox(self._shape(part)),
-                    "changed": self.prev_keys.get(part.id) != part.key,
+                    "changed": self.prev_keys.get(part.id) != part.key, "geom": part.geom, "material": part.material,
                 })
         # Keep previous geometry for sources that failed, so the view does not go blank.
         failed = {s["source"] for s in sources if s["error"]}
@@ -83,7 +95,8 @@ class Worker:
                 new_parts[pid] = part
                 out_parts.append({"id": pid, "name": part.name, "source": part.source, "key": part.key,
                                   "color": part.color, "mesh": os.path.join(mesh_dir, part.key + ".smsh"),
-                                  "bbox": _bbox(self._shape(part)), "changed": False, "stale": True})
+                                  "bbox": _bbox(self._shape(part)), "changed": False, "stale": True,
+                                  "geom": part.geom, "material": part.material})
         removed = [pid for pid in self.prev_keys if pid not in new_parts]
         self.parts = new_parts
         self.prev_keys = {pid: pt.key for pid, pt in new_parts.items()}
@@ -114,10 +127,21 @@ class Worker:
                 info["area_mm2"] = round(s.area, 4)
                 c = s.center(bd.CenterOf.MASS) if info["volume_mm3"] > 0 else s.center()
                 info["center_of_mass"] = [round(c.X, 4), round(c.Y, 4), round(c.Z, 4)]
+                mat = checks.material_info(part.material, self.materials)
+                if part.material:
+                    info["material"] = part.material
+                if mat and mat.get("density"):
+                    info["mass_g"] = round(info["volume_mm3"] * float(mat["density"]) / 1000.0, 3)
             except Exception as e:  # noqa: BLE001
                 info["properties_error"] = str(e)
             out.append(info)
-        return {"parts": out}
+        massed = [i for i in out if "mass_g" in i]
+        total = None
+        if massed:
+            m = sum(i["mass_g"] for i in massed)
+            com = [round(sum(i["mass_g"] * i["center_of_mass"][k] for i in massed) / m, 3) for k in range(3)] if m > 0 else None
+            total = {"mass_g": round(m, 3), "center_of_mass": com, "parts_with_material": len(massed), "parts_without_material": len(out) - len(massed)}
+        return {"parts": out, "total": total}
 
     def cmd_face_info(self, rid, p):
         """Describe one B-rep face. Face indices match the mesh face ranges (TopExp order)."""
@@ -157,12 +181,7 @@ class Worker:
         a, b = self._select([p["a"], p["b"]])
         sa, sb = self._shape(a), self._shape(b)
         d = sa.distance_to(sb)
-        inter = 0.0
-        try:
-            common = sa.intersect(sb)
-            inter = common.volume if common is not None else 0.0
-        except Exception:  # noqa: BLE001
-            inter = None
+        inter = checks.overlap_volume(sa, sb)
         return {"a": a.id, "b": b.id, "min_distance_mm": round(d, 5),
                 "intersection_volume_mm3": None if inter is None else round(inter, 5)}
 
@@ -187,6 +206,149 @@ class Worker:
             bd.export_brep(shape, path)
         elif fmt in ("glb", "gltf"):
             bd.export_gltf(shape, path, binary=fmt == "glb")
+        elif fmt == "3mf":
+            mesher = bd.Mesher()
+            for s in shapes:
+                mesher.add_shape(s, linear_deflection=0.01, angular_deflection=0.1)
+            mesher.write(path)
         else:
             raise ValueError(f"unknown format {fmt}")
         return {"path": path, "bytes": os.path.getsize(path), "parts": len(parts)}
+
+    # ------------------------------------------------------------ design checks
+    def _items(self, parts=None, extra_parts=None):
+        """(part, placed shape, fingerprint) for the given parts (default: all of the last build)."""
+        out = []
+        for part in (parts if parts is not None else list(self.parts.values())):
+            m = self.placements.get(part.id)
+            fp = part.geom + ("|" + ",".join(f"{x:.6g}" for x in m) if m else "")
+            out.append((part, self._shape(part), fp))
+        return out
+
+    def cmd_check_design(self, rid, p):
+        ids = p.get("ids")
+        parts = self._select(ids) if ids else list(self.parts.values())
+        deadline = time.monotonic() + float(p.get("time_limit", 120))
+        return checks.evaluate(self._items(parts), p.get("rules") or [], float(p.get("near", 0.5)), deadline)
+
+    def cmd_sweep(self, rid, p):
+        """Rebuild the scripts that define parameter `param` at each value (in memory), then check
+        clearances and the rules at every pose. The project files are not changed."""
+        name = str(p["param"])
+        values = [float(v) for v in p["values"]][:400]
+        lb = self.last_build
+        if not lb.get("sources"):
+            raise RuntimeError("build the project first")
+        progress = self._progress(rid)
+        pat = re.compile(rf"^{re.escape(name)}(\s*:\s*(?:int|float))?\s*=\s*-?\d", re.M)
+        scripts = []
+        for rel in lb["sources"]:
+            if rel.endswith(".py") and (p.get("file") in (None, rel)):
+                try:
+                    with open(os.path.join(lb["project_dir"], rel), encoding="utf-8") as f:
+                        if pat.search(f.read()):
+                            scripts.append(rel)
+                except OSError:
+                    pass
+        if not scripts:
+            raise ValueError(f"no shown script defines a top-level parameter {name} (e.g. `{name} = 0`)")
+        sel = p.get("ids")
+        rules = p.get("rules") or []
+        near = float(p.get("near", 0.5))
+        static = [pt for pt in self.parts.values() if pt.source not in scripts]
+        cache: dict = {}
+        poses, pair_min = [], {}
+        deadline = time.monotonic() + float(p.get("time_limit", 600))
+        t0 = time.perf_counter()
+        for k, v in enumerate(values):
+            if time.monotonic() > deadline:
+                break
+            progress(f"Pose {name} = {v:g} ({k + 1}/{len(values)})", done=k, total=len(values))
+            moving, errors = [], []
+            for rel in scripts:
+                res = load_source(rel, lb["project_dir"], lb["cache_dir"], lb.get("quality") or "normal", lambda *a, **kw: None, {name: v})
+                if res.error:
+                    errors.append(f"{rel}: {res.error['message']}")
+                moving += res.parts
+            parts = static + moving
+            if sel:
+                parts = [pt for pt in parts if any(checks.matches(pt, s) for s in sel)]
+            items = self._items(parts)
+            if rules:
+                rep = checks.evaluate(items, rules, near, deadline)
+                pairs = rep["pairs"]
+                fails = [{"id": r["id"], "kind": r["kind"], "detail": r["detail"]} for r in rep["results"] if r["status"] == "fail"]
+            else:
+                pairs, _ = checks.pair_report(items, near, None, cache, deadline)
+                fails = []
+            inter = [x for x in pairs if x["kind"] == "interference" and not x.get("allowed_by")]
+            for x in pairs:
+                key = (x["a"], x["b"])
+                cur = pair_min.get(key)
+                score = x["distance_mm"] - (x["overlap_mm3"] or 0)
+                if cur is None or score < cur["score"]:
+                    pair_min[key] = {"a": x["a"], "b": x["b"], "a_name": x["a_name"], "b_name": x["b_name"], "score": score,
+                                     "min_distance_mm": x["distance_mm"], "max_overlap_mm3": x["overlap_mm3"], "at": v, "kind": x["kind"],
+                                     "allowed_by": x.get("allowed_by")}
+            poses.append({"value": v, "interferences": len(inter), "worst": inter[0] if inter else (pairs[0] if pairs else None),
+                          "rule_failures": fails, "errors": errors})
+        worst_pairs = sorted(pair_min.values(), key=lambda r: r["score"])[:40]
+        for r in worst_pairs:
+            r.pop("score", None)
+        bad = [x["value"] for x in poses if x["interferences"] or x["rule_failures"] or x["errors"]]
+        return {"param": name, "scripts": scripts, "values": values, "poses_checked": len(poses), "poses": poses,
+                "closest_pairs": worst_pairs, "failing_poses": bad, "near_mm": near,
+                "seconds": round(time.perf_counter() - t0, 2), "complete": len(poses) == len(values)}
+
+    def cmd_printability(self, rid, p):
+        out = []
+        for part in self._select(p.get("ids")):
+            out.append(checks.printability(part, self._shape(part), float(p.get("overhang_deg", 45)), p.get("bed"), float(p.get("nozzle", 0.4))))
+        return {"parts": out}
+
+    def cmd_slice(self, rid, p):
+        """Analysis slicing with a PrusaSlicer-family CLI. The G-code stays in the cache (it is an
+        analysis artefact for a generic profile, not a print file)."""
+        part = self._select([p["id"]])[0]
+        exe = p.get("slicer")
+        if not exe or not shutil.which(exe) and not os.path.exists(exe):
+            raise RuntimeError("no slicer found (PrusaSlicer or SuperSlicer); set its path in Settings > Printing")
+        out_dir = p["out_dir"]
+        os.makedirs(out_dir, exist_ok=True)
+        stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", part.name)[:60] or "part"
+        stl = os.path.join(out_dir, stem + ".stl")
+        shape = self._shape(part)
+        # Bed = lowest Z: put the part on the bed as placed.
+        bb = shape.bounding_box()
+        bd.export_stl(shape.moved(bd.Location(bd.Vector(0, 0, -bb.min.Z))), stl)
+        prof = p.get("profile") or {}
+        bed = prof.get("bed") or [220, 220, 250]
+        support = bool(p.get("support"))
+        ini = {
+            "nozzle_diameter": prof.get("nozzle", 0.4), "filament_diameter": prof.get("filament", 1.75),
+            "layer_height": prof.get("layer", 0.2), "first_layer_height": prof.get("layer", 0.2),
+            "perimeters": prof.get("perimeters", 3), "top_solid_layers": 4, "bottom_solid_layers": 4,
+            "fill_density": f"{prof.get('infill', 15)}%", "fill_pattern": "gyroid",
+            "support_material": 1 if support else 0, "support_material_auto": 1,
+            "support_material_threshold": int(prof.get("overhang", 45)) if support else 0,
+            "support_material_contact_distance": 0.2,
+            "bed_shape": f"0x0,{bed[0]}x0,{bed[0]}x{bed[1]},0x{bed[1]}", "max_print_height": bed[2],
+            "gcode_flavor": "marlin2", "skirts": 1, "brim_width": prof.get("brim", 0),
+            "temperature": 210, "first_layer_temperature": 215, "bed_temperature": 60, "first_layer_bed_temperature": 60,
+        }
+        ini_path = os.path.join(out_dir, "analysis-profile.ini")
+        with open(ini_path, "w") as f:
+            f.write("".join(f"{k} = {v}\n" for k, v in ini.items()))
+        gcode = os.path.join(out_dir, stem + ("-support" if support else "-nosupport") + ".gcode")
+        cmd = [exe, "--load", ini_path, "--export-gcode", "--output", gcode, stl]
+        env = {k: v for k, v in os.environ.items() if k not in ("ELECTRON_RUN_AS_NODE",)}
+        t0 = time.perf_counter()
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=float(p.get("timeout", 300)), env=env)
+        log = (r.stdout + r.stderr)[-6000:]
+        if r.returncode != 0 or not os.path.exists(gcode):
+            raise RuntimeError(f"slicer failed (exit {r.returncode}): {log[-1500:]}")
+        data = checks.read_gcode(gcode)
+        warnings = [ln.strip() for ln in log.splitlines() if re.search(r"warn|issue|stabil|bridge|overhang|empty layer", ln, re.I)][:20]
+        return {"id": part.id, "name": part.name, "support": support, "slicer": os.path.basename(exe), "seconds": round(time.perf_counter() - t0, 1),
+                "warnings": warnings, "gcode": gcode, **data,
+                "note": "Generic analysis profile; the G-code is not meant for your printer. Slice the exported part with your own profile."}

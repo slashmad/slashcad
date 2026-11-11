@@ -28,6 +28,8 @@ class Part:
     shape: object
     color: tuple | None
     key: str
+    geom: str = ""  # geometry fingerprint without mesh quality (protected-part checks, pose caches)
+    material: str | None = None
 
 
 @dataclass
@@ -183,14 +185,15 @@ def load_sc(path: str, cache_dir: str, progress) -> object:
 _shown: list = []
 
 
-def _show(*objs, name=None, color=None, names=None, colors=None, **_kw):
+def _show(*objs, name=None, color=None, names=None, colors=None, material=None, materials=None, **_kw):
     for i, o in enumerate(objs):
         n = name if name and len(objs) == 1 else (names[i] if names and i < len(names) else name)
         c = color if color is not None and len(objs) == 1 else (colors[i] if colors and i < len(colors) else color)
-        _shown.append((o, n, c))
+        m = material if material is not None and len(objs) == 1 else (materials[i] if materials and i < len(materials) else material)
+        _shown.append((o, n, c, m))
 
 
-_context = {"cache_dir": None, "project_dir": None}
+_context = {"cache_dir": None, "project_dir": None, "materials": {}}
 _loaded: dict = {}
 
 
@@ -244,13 +247,40 @@ def _user_frame(tb, path: str):
     return line
 
 
-def run_script(path: str, project_dir: str):
-    """Execute a build123d script; return list of (obj, name, colour) and captured output."""
+_PARAM_RE = r"^({name})(\s*:\s*(?:int|float))?(\s*=\s*)(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+
+
+def apply_overrides(src: str, overrides: dict) -> tuple[str, list]:
+    """Replace top-level numeric assignments (`NAME = 12.5`) with other values, as the Params panel
+    does, but only in memory. Returns the new text and the names that were found."""
+    import re
+
+    found = []
+    for name, value in (overrides or {}).items():
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
+            continue
+        val = float(value)
+
+        def put(m, val=val):
+            was_int = not re.search(r"[.eE]", m.group(4))
+            text = str(int(val)) if was_int and val.is_integer() else repr(val)
+            return m.group(1) + (m.group(2) or "") + m.group(3) + text
+
+        src, n = re.subn(_PARAM_RE.format(name=name), put, src, count=1, flags=re.M)
+        if n:
+            found.append(name)
+    return src, found
+
+
+def run_script(path: str, project_dir: str, overrides: dict | None = None):
+    """Execute a build123d script; return list of (obj, name, colour, material) and captured output."""
     _install_shims()
     _purge_project_modules(project_dir)
     _shown.clear()
     with open(path, encoding="utf-8") as f:
         src = f.read()
+    if overrides:
+        src, _ = apply_overrides(src, overrides)
     code = compile(src, path, "exec")
     ns = {"__name__": "__main__", "__file__": path, "show": _show, "show_object": sys.modules["slashcad"].show_object}
     out = io.StringIO()
@@ -266,9 +296,9 @@ def run_script(path: str, project_dir: str):
     shown = list(_shown)
     if not shown:
         if "result" in ns:
-            shown = [(ns["result"], None, None)]
+            shown = [(ns["result"], None, None, None)]
         else:
-            shown = [(v, k, None) for k, v in ns.items()
+            shown = [(v, k, None, None) for k, v in ns.items()
                      if not k.startswith("_") and isinstance(v, (bd.Part, bd.Solid, bd.Compound, bd.BuildPart))]
     return shown, out.getvalue()
 
@@ -276,7 +306,19 @@ def run_script(path: str, project_dir: str):
 # ---------------------------------------------------------------- dispatcher
 
 
-def load_source(rel: str, project_dir: str, cache_dir: str, quality: str, progress) -> SourceResult:
+def _material_color(material):
+    from .checks import material_info
+
+    info = material_info(material, _context.get("materials") or {})
+    if not info or not info.get("color"):
+        return None
+    try:
+        return color_tuple(bd.Color(info["color"]))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def load_source(rel: str, project_dir: str, cache_dir: str, quality: str, progress, overrides: dict | None = None) -> SourceResult:
     import time
 
     t0 = time.perf_counter()
@@ -296,13 +338,14 @@ def load_source(rel: str, project_dir: str, cache_dir: str, quality: str, progre
             root = getattr(shape, "label", "") or base
             for i, (lpath, leaf, col) in enumerate(leaves(shape, root)):
                 res.parts.append(Part(id=f"{rel}#{i}:{lpath}", name=lpath.split("/")[-1], source=rel, shape=leaf,
-                                      color=color_tuple(col), key=hashlib.sha1(f"{fp}|{i}|{quality}".encode()).hexdigest()))
+                                      color=color_tuple(col), key=hashlib.sha1(f"{fp}|{i}|{quality}".encode()).hexdigest(),
+                                      geom=f"{fp}|{i}"))
         elif ext in SCRIPT_EXT:
             progress(f"Running {rel}")
             _context["cache_dir"], _context["project_dir"] = cache_dir, project_dir
-            shown, res.log = run_script(path, project_dir)
+            shown, res.log = run_script(path, project_dir, overrides)
             n = 0
-            for obj, name, col in shown:
+            for obj, name, col, mat in shown:
                 shape = to_shape(obj)
                 if shape is None:
                     continue
@@ -314,9 +357,11 @@ def load_source(rel: str, project_dir: str, cache_dir: str, quality: str, progre
                             c = color_tuple(bd.Color(col))
                         except Exception:
                             c = None
-                    key = hashlib.sha1(f"{brep_hash(leaf)}|{quality}".encode()).hexdigest()
+                    geom = brep_hash(leaf)
+                    key = hashlib.sha1(f"{geom}|{quality}".encode()).hexdigest()
                     res.parts.append(Part(id=f"{rel}#{lpath}", name=lpath.split("/")[-1], source=rel, shape=leaf,
-                                          color=c or color_tuple(lcol), key=key))
+                                          color=c or color_tuple(lcol) or _material_color(mat), key=key, geom=geom,
+                                          material=str(mat).lower() if mat else None))
                     n += 1
             if not res.parts:
                 # Not an error: a fresh script may only hold comments. The log tells agents why.

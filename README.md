@@ -31,9 +31,10 @@ the agents' own traffic to their providers.
 └──────────────┴──────────────────────────────────────┴─────────────────────┘
 ```
 
-> **Status:** early development (0.4). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
+> **Status:** early development (0.5). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
 > Code. ChatGPT (Codex) runs real turns in the app. Its approval of SlashCAD's CAD tools was fixed in
-> 0.4 and has not yet been checked in a live session. The Windows installer works; the portable exe
+> 0.4 and has not yet been checked in a live session. The design checks of 0.5 are tested in the app
+> and through the MCP tools, but not yet in a real agent session. The Windows installer works; the portable exe
 > fix from 0.3.0-fix awaits confirmation, and the macOS build exists only as an untested CI job.
 
 ## What it is for
@@ -72,11 +73,13 @@ flowchart LR
    edits and commands appear as cards in the chat. Token use, context size and the subscription's
    5-hour and weekly limits are shown as they arrive.
 2. **CAD tools over MCP.** Each agent session gets SlashCAD's MCP server (`slashcad`) with these tools:
-   `build`, `get_scene`, `set_scene`, `inspect` (volume, area, bounding box, centre of mass, validity),
-   `measure` (distance or interference between parts), `render_view` (a PNG from any standard view,
-   without moving your camera), `highlight`, `export` (STEP/STL/GLB/BREP), `fetch_reference`
-   (download a datasheet or vendor model into `references/` after you confirm), `list_annotations`
-   and `resolve_annotation`.
+   `build`, `get_scene`, `set_scene`, `inspect` (volume, area, bounding box, centre of mass, mass,
+   validity), `measure` (distance or interference between parts), `render_view` (a PNG from any
+   standard view, without moving your camera), `highlight`, `export` (STEP/STL/3MF/GLB/BREP),
+   `fetch_reference` (download a datasheet or vendor model into `references/` after you confirm),
+   `list_annotations` and `resolve_annotation`, plus the design checks below: `check_design`,
+   `list_rules`, `add_rule`, `remove_rule`, `sweep_check`, `show_pose`, `printability`, `list_tests`
+   and `add_test_note`.
 3. **CAD worker.** A resident Python process (bundled CPython 3.13 with build123d and OpenCascade)
    runs the scripts. It caches STEP imports as BREP and meshes each part. It sends only changed parts
    to the view, together with B-rep edges and face ranges, so picking selects real CAD faces.
@@ -84,6 +87,19 @@ flowchart LR
    SolidWorks and Onshape mappings), a view cube, standard views, perspective/orthographic,
    shaded-with-edges and X-ray modes, section planes with caps, measuring, "Before" ghosts of
    changed parts, contact shadow and ambient occlusion.
+
+## Background
+
+SlashCAD is based on a large local project with about 50 CAD revisions: an enclosure with a sliding
+mechanism, built by AI agents from scripts, then printed and assembled by hand. Its build logs, the
+prompts and the results of real prints and fit tests showed what an agent needs beyond modelling.
+A model can be free of collisions and still fail in your hand: a part falls out, a nut cannot be
+inserted, a part flexes into its neighbour under load, or a watertight shape will not print without
+support. The design checks below come from those lessons.
+
+The checks were verified on copies of mechanism files from that project: the minimum clearances
+between moving parts at three slider positions match the project's own measurements to the
+micrometre. They are still nominal geometry checks. They do not replace a test print.
 
 ## Install
 
@@ -167,6 +183,43 @@ build123d shape, so new parts can be fitted to it.
   Placements are stored in the project. Measuring, export and the agent's tools all use the placed
   part, so a part laid flat exports ready for printing.
 
+## Design checks, motion and printing
+
+The **Checks** tab has four parts. Agents use the same checks through their tools.
+
+- **Rules** (`slashcad.rules.json` in the project, yours to version):
+  - *clearance* between parts;
+  - *intended contact* for press fits and glue joints;
+  - *retained*: moving the part must hit something, so a phone cannot lift out of its shell;
+  - *free path*: a nut or pin can be slid into place;
+  - *outer envelope*;
+  - *protected parts*, whose geometry must not change.
+
+  The rules and an all-pairs interference check run after every build. Click a result to highlight
+  the parts. Agents can propose rules; you confirm each one.
+- **Motion.** Pick a parameter that moves parts (for example `SLIDE = 0  # mm`) and a range.
+  SlashCAD rebuilds the model at every step in memory, without changing the file, and reports the
+  poses with interference or failed rules and the closest pairs. Click a pose to see it in the view;
+  a banner shows that the view is a preview, with a button to go back to the file.
+- **Print.** For your printer (*Settings › Printing*: bed, nozzle, layer, overhang limit, the fit
+  clearance your printer achieves):
+  - the overhang beyond the limit, painted red in the view;
+  - first-layer contact and whether the part fits the bed;
+  - which of the six axis orientations has the least overhang.
+
+  The bed is each part's lowest point as placed, so use *Lay flat* to choose the face on the bed.
+  With PrusaSlicer or SuperSlicer installed, a part can also be sliced with a generic profile to
+  get support volume, time and slicer warnings. That G-code stays in the cache and is not meant for
+  your printer.
+- **Tests** (`slashcad.tests.json`): a log of real prints and assemblies, with observations and
+  measured values against nominal ones. Agents read it before changing a printed design and treat
+  it as stronger evidence than any CAD check. They can log what you report in the chat after you
+  confirm.
+
+`show(part, name="lid", material="petg")` gives a part a material colour and density. *inspect* then
+reports mass and the combined centre of mass. Add your own materials under `"materials"` in the
+rules file. STEP and 3MF exports carry part names, so slicers list the parts by name.
+
 ## Privacy and safety
 
 - **Local only.** No telemetry, no accounts, no cloud service of its own. The app makes no network
@@ -183,6 +236,8 @@ build123d shape, so new parts can be fitted to it.
 - **Agents stay in the project.** They are told to work only inside the project folder. File edits
   and commands go through the approval cards unless you allow them. Memories an agent kept from
   other projects do not apply unless you confirm them.
+- **Your rules and test log are yours.** Agents can only propose rules and test notes; each one
+  needs your confirmation before it is written.
 - **Downloads only with your consent.** Every `fetch_reference` download asks you first. Only
   public http(s) addresses and data file types (models, PDF, images, text) are accepted, up to
   200 MB, and downloaded files are never run.

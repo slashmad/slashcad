@@ -177,6 +177,13 @@ export function ViewerPane(p: Props) {
         </div>
       )}
 
+      {p.build?.preview && (
+        <div className="pose-banner">
+          {t("vp.posePreview", { param: p.build.preview.param, value: p.build.preview.value, file: p.build.preview.file })}
+          <button className="primary" onClick={() => api.checks.preview(null)}>{t("vp.backToFile")}</button>
+        </div>
+      )}
+
       {measuring && <div className="hint">{t("vp.measureHint", { m: measure ? ` · ${measure}` : "" })}</div>}
       {xform && !measuring && <div className="hint low">{t(xform.mode === "move" ? "vp.moveHint" : "vp.rotateHint")}</div>}
       {p.toast && <div className="toast">{p.toast}</div>}

@@ -4,7 +4,7 @@ import { api } from "../api";
 import { useT } from "../i18n";
 import { DEFAULT_NAV, mappingTable } from "../viewer/navigation";
 
-type Page = "general" | "navigation" | "agents";
+type Page = "general" | "navigation" | "printing" | "agents";
 
 const NAV_DEFAULTS: Partial<Settings> = {
   navigation: DEFAULT_NAV.mapping, rightDragOrbits: true, orbitStyle: "turntable", orbitAround: "view-center", middleDoubleClick: "home",
@@ -39,7 +39,7 @@ export function SettingsDialog({ settings, info, onClose, onSaved }: { settings:
       <div className="modal settings" onClick={(e) => e.stopPropagation()}>
         <div className="settings-nav">
           <h3>{t("set.title")}</h3>
-          {(["general", "navigation", "agents"] as Page[]).map((p) => (
+          {(["general", "navigation", "printing", "agents"] as Page[]).map((p) => (
             <button key={p} className={page === p ? "on" : ""} onClick={() => setPage(p)}>{t(`set.${p}`)}</button>
           ))}
         </div>
@@ -110,6 +110,24 @@ export function SettingsDialog({ settings, info, onClose, onSaved }: { settings:
               </div>
               {check("fitOnViewChange", t("set.fitOnViewChange"))}
               <button className="link" onClick={() => setS({ ...s, ...NAV_DEFAULTS } as Settings)}>{t("set.restoreDefaults")}</button>
+            </>
+          )}
+
+          {page === "printing" && (
+            <>
+              <h4>{t("set.printing")}</h4>
+              <div className="muted small">{t("set.printHelp")}</div>
+              <div className="row"><span>{t("set.bed")}</span>
+                <span className="xyz">{[0, 1, 2].map((i) => (
+                  <input key={i} type="number" min={10} value={s.printerBed?.[i] ?? 0} title={"XYZ"[i]}
+                    onChange={(e) => { const b = [...(s.printerBed ?? [220, 220, 250])] as [number, number, number]; b[i] = Number(e.target.value); set("printerBed", b); }} />
+                ))}</span>
+              </div>
+              <label>{t("set.nozzle")} <input type="number" step={0.05} min={0.1} value={s.printerNozzle} onChange={(e) => set("printerNozzle", Number(e.target.value))} /></label>
+              <label>{t("set.layer")} <input type="number" step={0.02} min={0.04} value={s.printerLayer} onChange={(e) => set("printerLayer", Number(e.target.value))} /></label>
+              <label>{t("set.overhang")} <input type="number" step={1} min={20} max={80} value={s.overhangDeg} onChange={(e) => set("overhangDeg", Number(e.target.value))} /></label>
+              <label>{t("set.fitClearance")} <input type="number" step={0.01} min={0} value={s.fitClearance} onChange={(e) => set("fitClearance", Number(e.target.value))} /></label>
+              <label>{t("set.slicer")} <input placeholder={t("set.slicerAuto")} value={s.slicerPath ?? ""} onChange={(e) => set("slicerPath", e.target.value)} /></label>
             </>
           )}
 

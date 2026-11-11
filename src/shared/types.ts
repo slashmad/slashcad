@@ -39,6 +39,8 @@ export interface PartInfo {
   bbox: [[number, number, number], [number, number, number]];
   changed: boolean;
   stale?: boolean;
+  geom?: string; // geometry fingerprint (mesh-quality independent)
+  material?: string | null;
 }
 
 export interface SourceStatus {
@@ -58,6 +60,7 @@ export interface BuildResult {
   removed: string[];
   seconds: number;
   quality: string;
+  preview?: PosePreview | null; // set when the build shows a pose preview instead of the file's value
 }
 
 export interface BuildState {
@@ -177,6 +180,153 @@ export interface Settings {
   recentProjects: string[];
   lastAgent: AgentKind;
   buildTimeoutSec: number;
+  /** Printing: the user's printer for printability checks and print packages. */
+  printerBed: [number, number, number];
+  printerNozzle: number;
+  printerLayer: number;
+  overhangDeg: number;
+  fitClearance: number; // sliding fit the user's printer achieves (mm)
+  slicerPath?: string; // PrusaSlicer / SuperSlicer CLI; auto-detected when empty
+}
+
+// ---------------------------------------------------------------- design checks
+
+export type RuleKind = "interference" | "allow_contact" | "clearance" | "envelope" | "protected" | "retained" | "path_clear";
+
+/** One rule in slashcad.rules.json. Part patterns are globs on the part name or id. */
+export interface DesignRule {
+  id: string;
+  kind: RuleKind;
+  note?: string;
+  a?: string | string[];
+  b?: string | string[];
+  min?: number;
+  parts?: string | string[];
+  max?: [number | null, number | null, number | null];
+  fingerprints?: Record<string, string>;
+  part?: string | string[];
+  against?: string | string[];
+  direction?: [number, number, number];
+  directions?: [number, number, number][];
+  within?: number;
+  distance?: number;
+  step?: number;
+  enabled?: boolean;
+  by?: string; // who added it: "user" or the agent's name
+}
+
+export interface DesignFile {
+  version: 1;
+  rules: DesignRule[];
+  materials?: Record<string, { density?: number; color?: string; label?: string }>;
+  /** Default motion study: the parameter and range used by "Run sweep". */
+  sweep?: { param: string; from: number; to: number; step: number; file?: string };
+}
+
+export interface RuleResult {
+  id: string;
+  kind: string;
+  status: "pass" | "fail" | "warn";
+  detail: string;
+  parts?: string[];
+  pairs?: PairResult[];
+  value?: unknown;
+}
+
+export interface PairResult {
+  a: string;
+  b: string;
+  a_name: string;
+  b_name: string;
+  kind: "interference" | "touch" | "near";
+  distance_mm: number;
+  overlap_mm3: number | null;
+  allowed_by: string | null;
+}
+
+export interface DesignReport {
+  build: number;
+  at: number;
+  results: RuleResult[];
+  pairs: PairResult[];
+  pair_count: number;
+  summary: { fail: number; warn: number; pass: number };
+  parts: number;
+  seconds: number;
+  error?: string;
+  skipped?: string; // why automatic checks did not run
+}
+
+export interface SweepPose {
+  value: number;
+  interferences: number;
+  worst: PairResult | null;
+  rule_failures: { id: string; kind: string; detail: string }[];
+  errors: string[];
+}
+
+export interface SweepResult {
+  param: string;
+  scripts: string[];
+  values: number[];
+  poses_checked: number;
+  poses: SweepPose[];
+  closest_pairs: (Omit<PairResult, "distance_mm" | "overlap_mm3"> & { min_distance_mm: number; max_overlap_mm3: number | null; at: number })[];
+  failing_poses: number[];
+  near_mm: number;
+  seconds: number;
+  complete: boolean;
+  at?: number;
+}
+
+export interface PrintReport {
+  id: string;
+  name: string;
+  size_mm?: [number, number, number];
+  fits_bed?: boolean;
+  overhang_mm2?: number;
+  flat_down_mm2?: number;
+  bed_contact_mm2?: number;
+  surface_mm2?: number;
+  overhang_z_range?: [number, number] | null;
+  orientations?: { orientation: string; overhang_mm2: number; bed_contact_mm2: number; height_mm: number }[];
+  best_orientation?: string;
+  hints?: string[];
+  error?: string;
+  slice?: SliceResult[];
+}
+
+export interface SliceResult {
+  support: boolean;
+  slicer: string;
+  seconds: number;
+  warnings: string[];
+  support_filament_mm: number;
+  total_filament_mm: number;
+  layers: number;
+  footer: Record<string, string>;
+}
+
+/** Pose preview: a parameter value shown in the view without changing the file. */
+export interface PosePreview {
+  file: string;
+  param: string;
+  value: number;
+}
+
+/** A physical test or measurement in slashcad.tests.json (primary evidence over nominal CAD). */
+export interface TestEntry {
+  id: string;
+  date: string; // ISO date
+  title: string;
+  result: "pass" | "fail" | "partial" | "note";
+  observations: string;
+  parts?: string[]; // part names
+  measurements?: { what: string; value: number; unit: string; nominal?: number }[];
+  photos?: string[]; // project-relative paths (references/…)
+  revision?: string;
+  by?: string;
+  createdAt: number;
 }
 
 export interface McpActivity {

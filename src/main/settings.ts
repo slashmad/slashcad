@@ -30,6 +30,11 @@ const defaults: Settings = {
   recentProjects: [],
   lastAgent: "claude",
   buildTimeoutSec: 900,
+  printerBed: [220, 220, 250],
+  printerNozzle: 0.4,
+  printerLayer: 0.2,
+  overhangDeg: 45,
+  fitClearance: 0.2,
 };
 
 let cache: Settings | null = null;

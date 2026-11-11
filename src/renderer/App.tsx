@@ -373,6 +373,9 @@ export function App() {
         onShowAll={() => setHidden(new Set())}
         onImport={importFiles}
         onDelete={deleteFiles}
+        viewer={viewer}
+        settings={settings}
+        onOpenSettings={() => setShowSettings(true)}
       />
       <div className="splitter" onPointerDown={leftDrag} />
       <div className="center">

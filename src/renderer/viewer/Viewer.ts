@@ -367,6 +367,7 @@ export class Viewer {
     this.hidden = new Set(ids);
     this.renderer.shadowMap.needsUpdate = true;
     for (const p of this.parts.values()) this.applyMode(p);
+    this.refreshOverhang();
     this.requestRender();
   }
 
@@ -457,6 +458,7 @@ export class Viewer {
       this.hasFitted = true;
       this.fit(undefined, false);
     }
+    this.refreshOverhang();
     this.scheduleBvh();
     this.requestRender();
   }
@@ -1031,7 +1033,65 @@ export class Viewer {
     o.matrixWorldNeedsUpdate = true;
   }
 
+  // ------------------------------------------------------------------ printability overlay
+  private overhang: { deg: number; group: THREE.Group } | null = null;
+
+  /** Paint faces that overhang more than `deg` from vertical (bed = lowest Z of each part). */
+  setOverhang(deg: number | null): void {
+    if (this.overhang) { for (const c of [...this.overhang.group.children]) this.disposeObject(c); this.helpers.remove(this.overhang.group); }
+    this.overhang = deg === null ? null : { deg, group: new THREE.Group() };
+    if (this.overhang) { this.helpers.add(this.overhang.group); this.refreshOverhang(); }
+    this.requestRender();
+  }
+
+  get overhangDeg(): number | null { return this.overhang?.deg ?? null; }
+
+  /** Overhanging area per visible part (mm²), as painted. */
+  overhangAreas: Record<string, number> = {};
+
+  private refreshOverhang(): void {
+    const o = this.overhang;
+    if (!o) return;
+    for (const c of [...o.group.children]) this.disposeObject(c);
+    o.group.clear();
+    this.overhangAreas = {};
+    const limit = -Math.sin((o.deg * Math.PI) / 180);
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), n = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
+    for (const p of this.parts.values()) {
+      if (this.hidden.has(p.info.id)) continue;
+      const pos = p.mesh.geometry.getAttribute("position") as THREE.BufferAttribute;
+      const idx = p.mesh.geometry.getIndex();
+      if (!idx) continue;
+      const m = p.mesh.matrix;
+      const zmin = this.worldBox(p).min.z;
+      const out: number[] = [];
+      let area = 0;
+      for (let i = 0; i < idx.count; i += 3) {
+        a.fromBufferAttribute(pos, idx.getX(i)).applyMatrix4(m);
+        b.fromBufferAttribute(pos, idx.getX(i + 1)).applyMatrix4(m);
+        c.fromBufferAttribute(pos, idx.getX(i + 2)).applyMatrix4(m);
+        n.crossVectors(e1.subVectors(b, a), e2.subVectors(c, a));
+        const len = n.length();
+        if (len < 1e-12) continue;
+        const nz = n.z / len;
+        if (nz >= limit) continue;
+        if (nz < -0.985 && Math.max(a.z, b.z, c.z) <= zmin + 0.05) continue; // on the bed
+        out.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
+        area += len / 2;
+      }
+      if (!out.length) continue;
+      this.overhangAreas[p.info.id] = area;
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute(out, 3));
+      const mesh = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xe5484d, transparent: true, opacity: 0.7, side: THREE.DoubleSide,
+        polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2, depthWrite: false }));
+      mesh.renderOrder = 3;
+      o.group.add(mesh);
+    }
+  }
+
   private placementChanged(): void {
+    this.refreshOverhang();
     this.recomputeBounds();
     this.renderer.shadowMap.needsUpdate = true;
     if (this.selection) this.select(this.selection);
