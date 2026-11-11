@@ -1,6 +1,6 @@
 // Codex adapter: the user's own `codex app-server` (JSON-RPC without the jsonrpc field, JSONL over stdio).
-// Verified 2026-11-08 with the VS Code-bundled 0.162.0-alpha: initialize, account, rate limits, thread/start.
-// Turns and approvals were blocked by the user's weekly limit and are implemented from the schema.
+// Verified with the VS Code-bundled 0.162.0-alpha: initialize, account, rate limits, thread/start (2026-11-08)
+// and real turns (2026-11-11). MCP tool calls are approved through `mcpServer/elicitation/request`.
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { PermissionDecision, SessionSummary, UsageSnapshot } from "../../shared/types";
 import { AgentSession, type AgentStartOptions } from "./base";
@@ -33,6 +33,8 @@ export class CodexRpc {
         "-c", `mcp_servers.${name}.args=[${m.args.map(tomlString).join(", ")}]`,
         "-c", `mcp_servers.${name}.env=${envToml}`,
       );
+      // Builds of large models and downloads the user must confirm take longer than Codex's default.
+      if (name === MCP_NAME) args.push("-c", `mcp_servers.${name}.tool_timeout_sec=900`);
     }
     const spec = spawnSpec(binary, args);
     this.proc = spawn(spec.command, spec.args, { cwd, env: agentEnv(spec.env), stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
@@ -103,7 +105,9 @@ export class CodexSession extends AgentSession {
   private rpc: CodexRpc | null = null;
   private threadId: string | null = null;
   private turnId: string | null = null;
-  private pendingApprovals = new Map<string, { id: number | string; method: string }>();
+  private pendingApprovals = new Map<string, { id: number | string; method: string; server?: string; content?: Record<string, unknown> }>();
+  private trustedServers = new Set<string>([MCP_NAME]); // MCP servers whose tool calls need no card
+  private replaying = false;
   private usage: UsageSnapshot = { agent: "codex", windows: [] };
   private turnStart = 0;
 
@@ -148,7 +152,8 @@ export class CodexSession extends AgentSession {
   }
 
   private replayTurns(turns: any[]): void {
-    for (const t of turns) for (const item of t.items ?? []) this.emitItem(item, true);
+    this.replaying = true;
+    try { for (const t of turns) for (const item of t.items ?? []) this.emitItem(item, true); } finally { this.replaying = false; }
   }
 
   private applyRateLimits(rl: any, ordinaryAllowed?: boolean): void {
@@ -177,6 +182,12 @@ export class CodexSession extends AgentSession {
     const req = this.pendingApprovals.get(requestId);
     if (!req || !this.rpc) return;
     this.pendingApprovals.delete(requestId);
+    if (req.method === "mcpServer/elicitation/request") {
+      if (decision === "allow-always" && req.server) this.trustedServers.add(req.server);
+      this.rpc.respond(req.id, decision === "deny" ? { action: "decline", content: null } : { action: "accept", content: req.content ?? {} });
+      this.emitEvent({ type: "permission-resolved", requestId, decision });
+      return;
+    }
     const d = decision === "deny" ? "decline" : decision === "allow-always" ? "acceptForSession" : "accept";
     const legacy = req.method === "execCommandApproval" || req.method === "applyPatchApproval";
     this.rpc.respond(req.id, { decision: legacy ? (d === "decline" ? "denied" : d === "acceptForSession" ? "approved_for_session" : "approved") : d });
@@ -188,8 +199,30 @@ export class CodexSession extends AgentSession {
     this.rpc = null;
   }
 
+  /**
+   * Codex asks before it calls an MCP tool (an MCP "elicitation" in form mode). SlashCAD's own
+   * CAD tools are approved automatically, like for Claude; other servers (SolidCraft) get a card.
+   * Requests the app cannot show (URL mode, forms with required fields) are declined with a note.
+   */
+  private onElicitation(id: number | string, p: any): void {
+    const server = String(p?.serverName ?? "");
+    const message = String(p?.message ?? "");
+    const content = p?.mode === "form" ? formDefaults(p?.requestedSchema) : null;
+    if (!content) {
+      this.rpc?.respond(id, { action: "decline", content: null });
+      this.emitEvent({ type: "error", message: `Codex asked "${message}" (${server || "MCP"}), which SlashCAD cannot show; declined.` });
+      return;
+    }
+    if (this.trustedServers.has(server)) { this.rpc?.respond(id, { action: "accept", content }); return; }
+    const requestId = `codex-${id}`;
+    this.pendingApprovals.set(requestId, { id, method: "mcpServer/elicitation/request", server, content });
+    this.emitEvent({ type: "permission", requestId, tool: `MCP · ${server}`, input: p?._meta ?? message, description: message, canAlways: true });
+  }
+
   private onServerRequest(id: number | string, method: string, p: any): void {
-    if (/requestApproval$|Approval$/.test(method)) {
+    if (method === "mcpServer/elicitation/request") {
+      this.onElicitation(id, p);
+    } else if (/requestApproval$|Approval$/.test(method)) {
       const requestId = `codex-${id}`;
       this.pendingApprovals.set(requestId, { id, method });
       const tool = method.includes("fileChange") || method === "applyPatchApproval" ? "File change" : method.includes("permissions") ? "Permission" : "Command";
@@ -197,7 +230,7 @@ export class CodexSession extends AgentSession {
         type: "permission", requestId, tool, input: p?.command ?? p?.changes ?? p, description: p?.reason ?? p?.cwd ?? undefined, canAlways: true,
       });
     } else {
-      // Unsupported interactive request (user input, elicitation): decline so the turn continues.
+      // Unsupported interactive request (user input): answer empty so the turn continues.
       this.rpc?.respond(id, method.includes("requestUserInput") ? { answers: {} } : { action: "decline" });
     }
   }
@@ -206,8 +239,9 @@ export class CodexSession extends AgentSession {
     const ts = Date.now();
     switch (item?.type) {
       case "userMessage": {
+        // Live prompts are already shown by the app when sent; only replayed history needs them.
         const text = (item.content ?? []).map((c: any) => c.text ?? "").join("");
-        if (completed && text) this.emitEvent({ type: "user", id: item.id, text, ts });
+        if (completed && text && this.replaying) this.emitEvent({ type: "user", id: item.id, text, ts });
         break;
       }
       case "agentMessage":
@@ -268,6 +302,22 @@ export class CodexSession extends AgentSession {
       }
     }
   }
+}
+
+/**
+ * Content for accepting a form elicitation: defaults for every field, `true` for confirmation
+ * booleans. Returns null when a required field has no default (the app cannot fill it in).
+ */
+export function formDefaults(schema: any): Record<string, unknown> | null {
+  const props: Record<string, any> = schema?.properties ?? {};
+  const required = new Set<string>(Array.isArray(schema?.required) ? schema.required : []);
+  const out: Record<string, unknown> = {};
+  for (const [k, f] of Object.entries(props)) {
+    if (f && f.default !== undefined && f.default !== null) out[k] = f.default;
+    else if (f?.type === "boolean") out[k] = /approve|allow|accept|confirm|consent|run|proceed/i.test(k);
+    else if (required.has(k)) return null;
+  }
+  return out;
 }
 
 export async function listCodexSessions(binary: string, cwd: string): Promise<SessionSummary[]> {

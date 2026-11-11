@@ -19,6 +19,14 @@ export interface ProjectInfo {
   isNew?: boolean;
   singleFile?: string; // set when a single model file was opened
   scripts?: string[]; // .py entries of the scene
+  /** User placement per part id: a column-major 4x4 matrix (THREE.Matrix4.elements), rigid only. */
+  placements?: Record<string, number[]>;
+}
+
+/** Undo/redo availability, with the labels of the next steps. */
+export interface HistoryState {
+  undo: string | null;
+  redo: string | null;
 }
 
 export interface PartInfo {

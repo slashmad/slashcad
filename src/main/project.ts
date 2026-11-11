@@ -83,19 +83,25 @@ export class Project extends EventEmitter {
     let quality: ProjectInfo["quality"] = "normal";
     let trusted = false;
     let isNew = true;
+    let placements: Record<string, number[]> = {};
     try {
       const j = JSON.parse(readFileSync(pj, "utf8"));
       isNew = false;
       scene = Array.isArray(j.scene) ? j.scene : null;
       if (j.quality) quality = j.quality;
       trusted = j.trusted === true;
+      if (j.placements && typeof j.placements === "object") {
+        for (const [id, m] of Object.entries(j.placements)) {
+          if (Array.isArray(m) && m.length === 16 && m.every((x) => typeof x === "number" && Number.isFinite(x))) placements[id] = m as number[];
+        }
+      }
     } catch { /* new project */ }
     if (this.singleFile) scene = [this.singleFile];
     if (!scene) scene = this.defaultScene();
     if (forceTrusted) trusted = true;
     return {
       dir: this.dir, name: this.singleFile ?? basename(this.dir), scene, quality, trusted, isNew,
-      singleFile: this.singleFile ?? undefined, scripts: this.scriptsIn(scene),
+      singleFile: this.singleFile ?? undefined, scripts: this.scriptsIn(scene), placements,
     };
   }
 
@@ -124,14 +130,33 @@ export class Project extends EventEmitter {
   saveInfo(): void {
     this.info.scripts = this.scriptsIn(this.info.scene);
     this.info.isNew = false;
-    writeFileSync(join(this.stateDir, "project.json"), JSON.stringify({ scene: this.info.scene, quality: this.info.quality, trusted: this.info.trusted }, null, 2));
+    writeFileSync(join(this.stateDir, "project.json"), JSON.stringify({ scene: this.info.scene, quality: this.info.quality, trusted: this.info.trusted, placements: this.info.placements ?? {} }, null, 2));
     this.emit("info", this.info);
   }
 
   setScene(scene: string[]): void {
+    const before = [...this.info.scene];
     this.info.scene = [...new Set(scene)].filter((s) => existsSync(join(this.dir, s)));
     this.saveInfo();
+    if (before.join("\n") !== this.info.scene.join("\n")) this.emit("scene-changed", { before, after: [...this.info.scene] });
   }
+
+  /** Set or clear (null) the user placement of a part. */
+  setPlacement(id: string, matrix: number[] | null): void {
+    const all = { ...(this.info.placements ?? {}) };
+    const before = all[id] ?? null;
+    if (matrix) all[id] = matrix; else delete all[id];
+    this.info.placements = all;
+    this.saveInfo();
+    this.emit("placement-changed", { id, before, after: matrix });
+  }
+
+  /** Text the watcher compares against, so changes the app makes itself (undo) are not recorded as edits. */
+  setSnapshot(rel: string, text: string | null): void {
+    if (text === null) this.snapshots.delete(rel); else this.snapshots.set(rel, text);
+  }
+
+  isTextFile(rel: string): boolean { return this.isText(rel); }
 
   setQuality(q: ProjectInfo["quality"]): void {
     this.info.quality = q;
@@ -220,20 +245,23 @@ export class Project extends EventEmitter {
     const changed = [...this.pending];
     this.pending.clear();
     const diffs: FileDiff[] = [];
+    const edits: { path: string; before: string | null; after: string }[] = [];
     for (const rel of changed) {
       if (!this.isText(rel)) continue;
       let now: string | null = null;
       try { now = statSync(this.abs(rel)).size < MAX_TEXT ? readFileSync(this.abs(rel), "utf8") : null; } catch { now = null; }
+      const known = this.snapshots.has(rel);
       const before = this.snapshots.get(rel) ?? "";
       if (now === null) { this.snapshots.delete(rel); continue; }
       if (now === before) continue;
       this.snapshots.set(rel, now);
+      edits.push({ path: rel, before: known ? before : null, after: now });
       const d = makeDiff(rel, before, now);
       diffs.push(d);
       this.diffs.push(d);
     }
     if (this.diffs.length > 200) this.diffs.splice(0, this.diffs.length - 200);
-    this.emit("changed", { files: changed, diffs });
+    this.emit("changed", { files: changed, diffs, edits });
   }
 
   touchesScene(files: string[]): boolean {

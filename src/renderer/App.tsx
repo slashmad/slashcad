@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
-import type { AgentEvent, AgentKind, Annotation, BuildResult, BuildState, FileDiff, FileNode, McpActivity, Param, ProjectInfo, Settings, SnapshotRequest } from "../shared/types";
+import * as THREE from "three";
+import type { AgentEvent, AgentKind, Annotation, BuildResult, BuildState, FileDiff, FileNode, HistoryState, McpActivity, Param, ProjectInfo, Settings, SnapshotRequest } from "../shared/types";
 import { addActivity, initialAgent, reduce, type AgentState } from "./agentStore";
 import { api } from "./api";
 import { LangContext, translate } from "./i18n";
@@ -62,6 +63,10 @@ export function App() {
   const [scMenu, setScMenu] = useState(false);
   const [openMenu, setOpenMenu] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+  const [undoState, setUndoState] = useState<HistoryState>({ undo: null, redo: null });
+  const annotationsRef = useRef<Annotation[]>([]);
+  annotationsRef.current = annotations;
+  const placedFor = useRef<string | null>(null); // project whose placements the viewer has
   const langRef = useRef<"en" | "sv">("en");
   langRef.current = settings?.language ?? "en";
   const tr = (k: string, v?: Record<string, string | number>) => translate(langRef.current, k, v);
@@ -83,6 +88,16 @@ export function App() {
     const v = new Viewer(mountRef.current);
     v.onSelect = (s) => setSelection(s);
     v.onPinClick = (id) => setActiveAnn(id);
+    v.onPlacement = (id, m) => { api.placement.set(id, m); };
+    // Pins sit at world points on a part: when the part moves, they move with it.
+    v.onPlacementDelta = (id, delta) => {
+      for (const a of annotationsRef.current) {
+        if (a.partId !== id) continue;
+        const point = new THREE.Vector3(...a.point).applyMatrix4(delta).toArray();
+        const normal = a.normal ? new THREE.Vector3(...a.normal).transformDirection(delta).toArray() : null;
+        api.annotations.update(a.id, { point, normal });
+      }
+    };
     (window as any).__viewer = v; // used by the main-process test hooks
     setViewer(v);
     return () => v.dispose();
@@ -109,6 +124,45 @@ export function App() {
   }, [viewer, settings]);
 
   useEffect(() => { viewer?.setAnnotations(annotations, activeAnn); }, [viewer, annotations, activeAnn]);
+
+  // Part placements: applied silently right after a project opens (pins are already stored placed).
+  useEffect(() => {
+    if (!viewer || !info) return;
+    const fresh = placedFor.current !== info.dir;
+    placedFor.current = info.dir;
+    viewer.setPlacements(info.placements, fresh);
+  }, [viewer, info?.dir, info?.placements]);
+
+  const undo = useCallback(async (redo = false) => {
+    const label = redo ? await api.history.redo() : await api.history.undo();
+    showToast(label ? translate(langRef.current, redo ? "toast.redone" : "toast.undone", { what: label }) : translate(langRef.current, redo ? "app.nothingRedo" : "app.nothingUndo"), 2500);
+  }, [showToast]);
+
+  // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y, except while typing (text fields keep their own undo).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey) return;
+      if (e.target instanceof Element && e.target.closest("textarea, input, select, [contenteditable=true]")) return;
+      const k = e.key.toLowerCase();
+      if (k === "z") { e.preventDefault(); undo(e.shiftKey); }
+      else if (k === "y") { e.preventDefault(); undo(true); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [undo]);
+
+  const importFiles = async (destDir?: string, paths?: string[]) => {
+    try {
+      const done = paths ? await api.project.importPaths(paths, destDir) : await api.project.importDialog(destDir);
+      if (done.length) showToast(tr("toast.imported", { n: done.length, list: done.slice(0, 4).join(", ") + (done.length > 4 ? " …" : "") }), 4000);
+    } catch (e: any) { showToast(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""), 6000); }
+  };
+  const deleteFiles = async (paths: string[]) => {
+    try {
+      const n = await api.project.remove(paths);
+      if (n) showToast(tr("toast.deleted", { n }), 4000);
+    } catch (e: any) { showToast(String(e?.message ?? e).replace(/^Error invoking remote method '[^']+': (Error: )?/, ""), 6000); }
+  };
 
   // Apply a build: fetch only meshes we don't have, then swap parts in place.
   const applyBuild = useCallback(async (r: BuildResult, v: Viewer | null, first: boolean) => {
@@ -165,6 +219,7 @@ export function App() {
         viewerRef.current?.clear();
       }),
       api.project.onInfo((i: ProjectInfo) => setInfo(i)),
+      api.history.onState((h: HistoryState) => setUndoState(h)),
       api.annotations.onChanged((list: Annotation[]) => setAnnotations(list)),
       api.params.onChanged((list: Param[]) => setParams(list)),
       api.project.onChanged((c: any) => {
@@ -233,8 +288,11 @@ export function App() {
     onDrop: (e: React.DragEvent) => {
       e.preventDefault();
       setDragOver(false);
-      const f = e.dataTransfer.files[0];
-      if (f) api.project.open(api.project.pathForFile(f));
+      const paths = [...e.dataTransfer.files].map((f) => api.project.pathForFile(f)).filter(Boolean);
+      if (!paths.length) return;
+      // With a project folder open, dropped files are imported into it; otherwise the first one opens.
+      if (info && tree && !info.singleFile) importFiles(undefined, paths);
+      else api.project.open(paths[0]);
     },
   };
 
@@ -281,6 +339,10 @@ export function App() {
             </div>
           )}
         </span>
+        <span className="undo-btns">
+          <button disabled={!undoState.undo} title={undoState.undo ? tr("app.undoTitle", { what: undoState.undo }) : tr("app.nothingUndo")} onClick={() => undo(false)}>↶</button>
+          <button disabled={!undoState.redo} title={undoState.redo ? tr("app.redoTitle", { what: undoState.redo }) : tr("app.nothingRedo")} onClick={() => undo(true)}>↷</button>
+        </span>
         <span className="grow" />
         <span className="menu-wrap">
           <button className={`sc-pill ${scInfo?.cli ? (scInfo.running ? "run" : "ok") : "off"}`} title={scInfo?.cli ? `${scInfo.version} · ${scInfo.cli}` : tr("sc.notFound")}
@@ -309,6 +371,8 @@ export function App() {
         onSelectPart={(id) => viewer?.selectPart(id)}
         onFitPart={(id) => viewer?.fit([id])}
         onShowAll={() => setHidden(new Set())}
+        onImport={importFiles}
+        onDelete={deleteFiles}
       />
       <div className="splitter" onPointerDown={leftDrag} />
       <div className="center">

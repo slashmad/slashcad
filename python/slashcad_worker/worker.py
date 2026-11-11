@@ -10,6 +10,14 @@ from .mesh import tessellate, write_smsh
 from .sources import SUPPORTED, load_source
 
 
+def _location(m) -> bd.Location:
+    """User placement: a column-major 4x4 rigid matrix (THREE.Matrix4.elements) -> Location."""
+    from OCP.gp import gp_Trsf
+    t = gp_Trsf()
+    t.SetValues(m[0], m[4], m[8], m[12], m[1], m[5], m[9], m[13], m[2], m[6], m[10], m[14])
+    return bd.Location(t)
+
+
 def _bbox(shape) -> list:
     bb = shape.bounding_box()
     return [[bb.min.X, bb.min.Y, bb.min.Z], [bb.max.X, bb.max.Y, bb.max.Z]]
@@ -20,6 +28,14 @@ class Worker:
         self.send = send
         self.parts: dict = {}      # id -> Part (last successful build)
         self.prev_keys: dict = {}  # id -> mesh key
+        self.placements: dict = {}  # id -> column-major 4x4 matrix set by the user in the view
+
+    def _shape(self, part):
+        """The part as placed by the user. Meshes stay in the source frame; the view applies the same matrix."""
+        m = self.placements.get(part.id)
+        if not m or len(m) != 16:
+            return part.shape
+        return part.shape.moved(_location(m))
 
     # ------------------------------------------------------------ helpers
     def _progress(self, rid):
@@ -37,6 +53,8 @@ class Worker:
         mesh_dir = os.path.join(cache_dir, "mesh")
         os.makedirs(mesh_dir, exist_ok=True)
         progress = self._progress(rid)
+        if "placements" in p:
+            self.placements = p.get("placements") or {}
         t0 = time.perf_counter()
         out_parts, sources, new_parts = [], [], {}
         for rel in p.get("sources", []):
@@ -55,7 +73,7 @@ class Worker:
                 new_parts[part.id] = part
                 out_parts.append({
                     "id": part.id, "name": part.name, "source": part.source, "key": part.key,
-                    "color": part.color, "mesh": mesh_path, "bbox": _bbox(part.shape),
+                    "color": part.color, "mesh": mesh_path, "bbox": _bbox(self._shape(part)),
                     "changed": self.prev_keys.get(part.id) != part.key,
                 })
         # Keep previous geometry for sources that failed, so the view does not go blank.
@@ -65,12 +83,16 @@ class Worker:
                 new_parts[pid] = part
                 out_parts.append({"id": pid, "name": part.name, "source": part.source, "key": part.key,
                                   "color": part.color, "mesh": os.path.join(mesh_dir, part.key + ".smsh"),
-                                  "bbox": _bbox(part.shape), "changed": False, "stale": True})
+                                  "bbox": _bbox(self._shape(part)), "changed": False, "stale": True})
         removed = [pid for pid in self.prev_keys if pid not in new_parts]
         self.parts = new_parts
         self.prev_keys = {pid: pt.key for pid, pt in new_parts.items()}
         return {"parts": out_parts, "sources": sources, "removed": removed,
                 "seconds": round(time.perf_counter() - t0, 3), "quality": quality}
+
+    def cmd_set_placements(self, rid, p):
+        self.placements = p.get("placements") or {}
+        return {"placed": len(self.placements)}
 
     def _select(self, ids):
         if not ids:
@@ -83,7 +105,7 @@ class Worker:
     def cmd_inspect(self, rid, p):
         out = []
         for part in self._select(p.get("ids")):
-            s = part.shape
+            s = self._shape(part)
             valid = s.is_valid() if callable(getattr(s, "is_valid", None)) else bool(getattr(s, "is_valid", True))
             info = {"id": part.id, "name": part.name, "source": part.source, "bbox": _bbox(s), "valid": valid,
                     "solids": len(s.solids()), "faces": len(s.faces()), "edges": len(s.edges())}
@@ -103,7 +125,7 @@ class Worker:
         from OCP.GeomAbs import GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus
 
         part = self._select([p["id"]])[0]
-        faces = part.shape.faces()
+        faces = self._shape(part).faces()
         i = int(p["face"])
         if not 0 <= i < len(faces):
             raise IndexError(f"face {i} does not exist (the part has {len(faces)} faces)")
@@ -133,10 +155,11 @@ class Worker:
 
     def cmd_measure(self, rid, p):
         a, b = self._select([p["a"], p["b"]])
-        d = a.shape.distance_to(b.shape)
+        sa, sb = self._shape(a), self._shape(b)
+        d = sa.distance_to(sb)
         inter = 0.0
         try:
-            common = a.shape.intersect(b.shape)
+            common = sa.intersect(sb)
             inter = common.volume if common is not None else 0.0
         except Exception:  # noqa: BLE001
             inter = None
@@ -150,7 +173,7 @@ class Worker:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         shapes = []
         for part in parts:
-            s = part.shape
+            s = self._shape(part)
             s.label = part.name
             if part.color:
                 s.color = bd.Color(*part.color)

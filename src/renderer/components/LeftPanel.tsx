@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import type { BuildResult, FileDiff, FileNode, Param, PartInfo, ProjectInfo } from "../../shared/types";
 import { api, fmtTime } from "../api";
 import { ParamsPanel } from "./ParamsPanel";
@@ -22,27 +22,50 @@ interface Props {
   onSelectPart(id: string): void;
   onFitPart(id: string): void;
   onShowAll(): void;
+  onImport(destDir?: string, paths?: string[]): void;
+  onDelete(paths: string[]): void;
 }
 
-function FileTree({ node, info, onToggle, onOpen, depth = 0 }: { node: FileNode; info: ProjectInfo; onToggle(p: string): void; onOpen(p: string): void; depth?: number }) {
+interface TreeSel {
+  selected: Set<string>;
+  click(path: string, e: React.MouseEvent): void;
+  menu(path: string, dir: boolean, e: React.MouseEvent): void;
+  dropInto(dir: string, e: React.DragEvent): void;
+}
+
+/** File and folder paths in display order (folders first), for Shift-click ranges. */
+function flatten(node: FileNode, out: string[] = []): string[] {
+  for (const c of node.children ?? []) { out.push(c.path); if (c.dir) flatten(c, out); }
+  return out;
+}
+
+function FileTree({ node, info, onToggle, onOpen, sel, depth = 0 }: { node: FileNode; info: ProjectInfo; onToggle(p: string): void; onOpen(p: string): void; sel: TreeSel; depth?: number }) {
   const t = useT();
   const [open, setOpen] = useState(depth < 2);
+  const [dropHere, setDropHere] = useState(false);
   if (node.dir) {
     return (
       <div>
         {depth > 0 && (
-          <div className="tree-row dir" style={{ paddingLeft: 6 + depth * 12 }} onClick={() => setOpen(!open)}>
+          <div className={`tree-row dir ${sel.selected.has(node.path) ? "sel" : ""} ${dropHere ? "drop" : ""}`} style={{ paddingLeft: 6 + depth * 12 }}
+            onClick={(e) => { if (e.ctrlKey || e.metaKey || e.shiftKey) sel.click(node.path, e); else setOpen(!open); }}
+            onContextMenu={(e) => sel.menu(node.path, true, e)}
+            onDragOver={(e) => { if (e.dataTransfer.types.includes("Files")) { e.preventDefault(); e.stopPropagation(); setDropHere(true); } }}
+            onDragLeave={() => setDropHere(false)}
+            onDrop={(e) => { setDropHere(false); sel.dropInto(node.path, e); }}>
             <span className="caret">{open ? "▾" : "▸"}</span>{node.name}
           </div>
         )}
-        {open && node.children?.map((c) => <FileTree key={c.path} node={c} info={info} onToggle={onToggle} onOpen={onOpen} depth={depth + 1} />)}
+        {open && node.children?.map((c) => <FileTree key={c.path} node={c} info={info} onToggle={onToggle} onOpen={onOpen} sel={sel} depth={depth + 1} />)}
       </div>
     );
   }
   const cad = isCad(node.path);
   const shown = info.scene.includes(node.path);
   return (
-    <div className={`tree-row file ${shown ? "shown" : ""}`} style={{ paddingLeft: 6 + depth * 12 }} onClick={() => onOpen(node.path)} title={node.path}>
+    <div className={`tree-row file ${shown ? "shown" : ""} ${sel.selected.has(node.path) ? "sel" : ""}`} style={{ paddingLeft: 6 + depth * 12 }}
+      onClick={(e) => { sel.click(node.path, e); if (!e.ctrlKey && !e.metaKey && !e.shiftKey) onOpen(node.path); }}
+      onContextMenu={(e) => sel.menu(node.path, false, e)} title={node.path}>
       {cad ? (
         <button className={`eye ${shown ? "on" : ""}`} title={shown ? t("left.shownHide") : t("left.show")} onClick={(e) => { e.stopPropagation(); onToggle(node.path); }}>{shown ? "◉" : "○"}</button>
       ) : <span className="eye-spacer" />}
@@ -133,6 +156,70 @@ function History({ history }: { history: BuildResult[] }) {
   );
 }
 
+function Files(p: Props) {
+  const t = useT();
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [menu, setMenu] = useState<{ x: number; y: number; path: string; dir: boolean } | null>(null);
+  const anchor = useRef<string | null>(null);
+  const order = useMemo(() => flatten(p.tree), [p.tree]);
+  // Forget selected paths that no longer exist (deleted, renamed).
+  const live = useMemo(() => new Set(order), [order]);
+  const sel = useMemo(() => [...selected].filter((x) => live.has(x)), [selected, live]);
+  const single = !!p.info.singleFile;
+  const treeSel: TreeSel = {
+    selected: new Set(sel),
+    click(path, e) {
+      if (e.shiftKey && anchor.current) {
+        const a = order.indexOf(anchor.current), b = order.indexOf(path);
+        if (a >= 0 && b >= 0) { setSelected(new Set(order.slice(Math.min(a, b), Math.max(a, b) + 1))); return; }
+      }
+      if (e.ctrlKey || e.metaKey) {
+        setSelected((cur) => { const n = new Set(cur); n.has(path) ? n.delete(path) : n.add(path); return n; });
+      } else setSelected(new Set([path]));
+      anchor.current = path;
+    },
+    menu(path, dir, e) {
+      e.preventDefault();
+      if (!selected.has(path)) { setSelected(new Set([path])); anchor.current = path; }
+      setMenu({ x: e.clientX, y: e.clientY, path, dir });
+    },
+    dropInto(dir, e) {
+      e.preventDefault(); e.stopPropagation();
+      const paths = [...e.dataTransfer.files].map((f) => api.project.pathForFile(f)).filter(Boolean);
+      if (paths.length) p.onImport(dir, paths);
+    },
+  };
+  const del = (paths: string[]) => { if (paths.length) p.onDelete(paths); };
+  return (
+    <div className="files" tabIndex={0} onKeyDown={(e) => {
+      if ((e.key === "Delete" || (e.key === "Backspace" && (e.metaKey || e.ctrlKey))) && sel.length && !single) { e.preventDefault(); del(sel); }
+      else if (e.key === "Escape") setSelected(new Set());
+    }}>
+      {!single && (
+        <div className="files-tools">
+          <button title={t("left.importTitle")} onClick={() => p.onImport()}>{t("left.import")}</button>
+          <button disabled={!sel.length} title={t("left.deleteTitle")} onClick={() => del(sel)}>{sel.length > 1 ? t("left.deleteN", { n: sel.length }) : t("left.delete")}</button>
+          <span className="grow" />
+          <span className="muted small" title={t("left.selectHint")}>ⓘ</span>
+        </div>
+      )}
+      <FileTree node={p.tree} info={p.info} onToggle={p.onToggleScene} onOpen={p.onOpenFile} sel={treeSel} />
+      {menu && (
+        <div className="ctx-back" onPointerDown={() => setMenu(null)} onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}>
+          <div className="menu ctx" style={{ left: menu.x, top: menu.y, position: "fixed" }} onPointerDown={(e) => e.stopPropagation()}>
+            {menu.dir && !single && <div className="menu-item" onClick={() => { setMenu(null); p.onImport(menu.path); }}>{t("left.importHere")}</div>}
+            <div className="menu-item" onClick={() => { setMenu(null); api.project.reveal(menu.path); }}>{t("left.reveal")}</div>
+            {!single && <>
+              <div className="menu-sep" />
+              <div className="menu-item danger" onClick={() => { setMenu(null); del(sel.length ? sel : [menu.path]); }}>{sel.length > 1 ? t("left.deleteN", { n: sel.length }) : t("left.delete")}</div>
+            </>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function LeftPanel(p: Props) {
   const t = useT();
   const [tab, setTab] = useState<"files" | "model" | "params" | "diffs" | "hist">("files");
@@ -146,7 +233,7 @@ export function LeftPanel(p: Props) {
         <button className={tab === "hist" ? "on" : ""} onClick={() => setTab("hist")}>{t("left.builds")}</button>
       </div>
       <div className="tab-body">
-        {tab === "files" && <FileTree node={p.tree} info={p.info} onToggle={p.onToggleScene} onOpen={p.onOpenFile} />}
+        {tab === "files" && <Files {...p} />}
         {tab === "model" && <ModelTree {...p} />}
         {tab === "params" && <ParamsPanel params={p.params} />}
         {tab === "diffs" && <Diffs diffs={p.diffs} onOpen={p.onOpenFile} />}

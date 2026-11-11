@@ -6,6 +6,7 @@ import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { GTAOPass } from "three/addons/postprocessing/GTAOPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
 import { acceleratedRaycast, computeBoundsTree, disposeBoundsTree } from "three-mesh-bvh";
 import type { Annotation, PartInfo, SnapshotRequest, ViewName } from "../../shared/types";
 import { Navigation, type NavConfig, type NavTool } from "./navigation";
@@ -19,6 +20,7 @@ THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
 
 export type DisplayMode = "shaded-edges" | "shaded" | "wire" | "xray";
 export type SectionAxis = "x" | "y" | "z" | null;
+export type TransformMode = "move" | "rotate";
 
 export interface Selection {
   partId: string;
@@ -117,6 +119,16 @@ export class Viewer {
   onFrame: (fps: number) => void = () => {};
   onPinClick: (id: string) => void = () => {};
   onContextMenu: (clientX: number, clientY: number, hit: Selection | null) => void = () => {};
+  /** The user finished moving/rotating a part: store this placement (null = none). */
+  onPlacement: (id: string, matrix: number[] | null) => void = () => {};
+  /** A stored placement changed by `delta` (world): pins and other world data on the part follow it. */
+  onPlacementDelta: (id: string, delta: THREE.Matrix4) => void = () => {};
+  onTransformChange: (t: { mode: TransformMode; id: string } | null) => void = () => {};
+  private placements = new Map<string, THREE.Matrix4>(); // committed placements
+  private tc: TransformControls | null = null;
+  private tcProxy = new THREE.Object3D();
+  private tcState: { mode: TransformMode; id: string } | null = null;
+  private tcDrag: { p0: THREE.Matrix4; g0: THREE.Matrix4 } | null = null;
   middleDoubleClick: "home" | "fit" | "none" = "home";
   animateViews = true;
   animationSpeed = 1;
@@ -307,6 +319,7 @@ export class Viewer {
     to.lookAt(this.target);
     to.updateProjectionMatrix();
     this.cam = to;
+    if (this.tc) (this.tc as any).camera = to;
     this.requestRender();
   }
 
@@ -425,8 +438,10 @@ export class Viewer {
       const edgeColor = lum < 0.06 ? new THREE.Color(0x8a94a3) : color.clone().multiplyScalar(0.18);
       const edges = new THREE.LineSegments(eg, new THREE.LineBasicMaterial({ color: edgeColor, transparent: true, opacity: 0.85 }));
       edges.userData.partId = info.id;
+      m.matrixAutoUpdate = edges.matrixAutoUpdate = false;
       this.root.add(m, edges);
       const obj: PartObj = { info, key: info.key, mesh: m, edges, faceStarts: mesh.faceStarts, material, bvh: false, flash: opts.flash && info.changed ? 1.6 : 0 };
+      this.applyPlacement(obj, this.placements.get(info.id) ?? null);
       this.applyMode(obj);
       this.parts.set(info.id, obj);
     }
@@ -436,6 +451,7 @@ export class Viewer {
       for (const g of newGhosts) this.ghosts.add(g);
     }
     if (this.selection && !this.parts.has(this.selection.partId)) this.select(null);
+    if (this.tcState) { const t = this.tcState; this.parts.has(t.id) ? this.startTransform(t.mode, t.id) : this.stopTransform(); }
     this.recomputeBounds();
     if (!this.hasFitted && this.parts.size) {
       this.hasFitted = true;
@@ -496,10 +512,7 @@ export class Viewer {
 
   private recomputeBounds(): void {
     const b = new THREE.Box3();
-    for (const p of this.parts.values()) {
-      const [mn, mx] = p.info.bbox;
-      b.expandByPoint(new THREE.Vector3(...mn)).expandByPoint(new THREE.Vector3(...mx));
-    }
+    for (const p of this.parts.values()) b.union(this.worldBox(p));
     if (b.isEmpty()) return;
     this.bounds.copy(b);
     this.updateGrid();
@@ -556,7 +569,7 @@ export class Viewer {
     const b = new THREE.Box3();
     for (const p of this.parts.values()) {
       if (ids ? !ids.includes(p.info.id) : this.hidden.has(p.info.id)) continue;
-      b.expandByPoint(new THREE.Vector3(...p.info.bbox[0])).expandByPoint(new THREE.Vector3(...p.info.bbox[1]));
+      b.union(this.worldBox(p));
     }
     return b.isEmpty() ? this.bounds.clone() : b;
   }
@@ -662,7 +675,9 @@ export class Viewer {
     const hit = hits.find((h) => planes.every((pl) => pl.distanceToPoint(h.point) >= -1e-6));
     if (!hit || hit.faceIndex == null) return null;
     const part = this.parts.get(hit.object.userData.partId)!;
-    return { partId: part.info.id, face: faceOfTriangle(part.faceStarts, hit.faceIndex), point: hit.point.clone(), normal: hit.face?.normal.clone() ?? null };
+    // Face normals are in the part's own frame; placements rotate them into the world.
+    const normal = hit.face ? hit.face.normal.clone().transformDirection(hit.object.matrixWorld) : null;
+    return { partId: part.info.id, face: faceOfTriangle(part.faceStarts, hit.faceIndex), point: hit.point.clone(), normal };
   }
 
   private faceGeometry(partId: string, face: number): THREE.BufferGeometry | null {
@@ -693,6 +708,7 @@ export class Viewer {
     if (key === this.hoverMesh.userData.key) return;
     this.hoverMesh.userData.key = key;
     this.hoverMesh.geometry = h ? this.faceGeometry(h.partId, h.face) ?? new THREE.BufferGeometry() : new THREE.BufferGeometry();
+    this.overlayFollow(this.hoverMesh, h?.partId);
     this.hoverMesh.visible = !!h && !this.measuring;
     this.renderer.domElement.style.cursor = h ? (this.measuring ? "crosshair" : "pointer") : "default";
     this.requestRender();
@@ -708,6 +724,7 @@ export class Viewer {
       return;
     }
     if (this.nav.tool !== "select") return;
+    if (this.tc && ((this.tc as any).dragging || this.tc.axis)) return; // a gizmo handle, not the model
     const pin = this.pickPin(e.clientX, e.clientY);
     if (pin) { this.onPinClick(pin); return; }
     const h = this.pick(e.clientX, e.clientY);
@@ -719,14 +736,13 @@ export class Viewer {
   selectPart(id: string): void {
     const p = this.parts.get(id);
     if (!p) return;
-    const b = new THREE.Box3(new THREE.Vector3(...p.info.bbox[0]), new THREE.Vector3(...p.info.bbox[1]));
-    this.select({ partId: id, face: -1, point: b.getCenter(new THREE.Vector3()), normal: null });
+    this.select({ partId: id, face: -1, point: this.worldBox(p).getCenter(new THREE.Vector3()), normal: null });
   }
 
   select(s: Selection | null): void {
     this.selection = s;
     this.selectMesh.visible = !!s && s.face >= 0;
-    if (s && s.face >= 0) this.selectMesh.geometry = this.faceGeometry(s.partId, s.face) ?? new THREE.BufferGeometry();
+    if (s && s.face >= 0) { this.selectMesh.geometry = this.faceGeometry(s.partId, s.face) ?? new THREE.BufferGeometry(); this.overlayFollow(this.selectMesh, s.partId); }
     for (const p of this.parts.values()) p.material.emissive.set(s && s.face < 0 && p.info.id === s.partId ? 0x0b1f4d : this.highlighted.has(p.info.id) ? 0x5a3200 : 0x000000);
     this.onSelect(s);
     this.requestRender();
@@ -985,7 +1001,163 @@ export class Viewer {
   }
 
   partBounds(id: string): PartInfo["bbox"] | null {
-    return this.parts.get(id)?.info.bbox ?? null;
+    const p = this.parts.get(id);
+    if (!p) return null;
+    const b = this.worldBox(p);
+    return [b.min.toArray() as [number, number, number], b.max.toArray() as [number, number, number]];
+  }
+
+  // ------------------------------------------------------------------ placement (move / rotate / lay flat)
+  /** World-space bounds of a part, including its placement. */
+  private worldBox(p: PartObj): THREE.Box3 {
+    const g = p.mesh.geometry;
+    if (!g.boundingBox) g.computeBoundingBox();
+    return g.boundingBox!.clone().applyMatrix4(p.mesh.matrix);
+  }
+
+  private applyPlacement(p: PartObj, m: THREE.Matrix4 | null): void {
+    for (const o of [p.mesh, p.edges]) {
+      if (m) o.matrix.copy(m); else o.matrix.identity();
+      o.matrixWorldNeedsUpdate = true;
+      o.updateMatrixWorld(true);
+    }
+  }
+
+  /** Face overlays share the part's geometry, so they need its placement too. */
+  private overlayFollow(o: THREE.Mesh, partId?: string): void {
+    o.matrixAutoUpdate = false;
+    const p = partId ? this.parts.get(partId) : null;
+    if (p) o.matrix.copy(p.mesh.matrix); else o.matrix.identity();
+    o.matrixWorldNeedsUpdate = true;
+  }
+
+  private placementChanged(): void {
+    this.recomputeBounds();
+    this.renderer.shadowMap.needsUpdate = true;
+    if (this.selection) this.select(this.selection);
+    this.requestRender();
+  }
+
+  /**
+   * Stored placements from the project. `silent` (project just opened) applies them without
+   * reporting deltas, because pins were saved in placed coordinates already.
+   */
+  setPlacements(all: Record<string, number[]> | undefined, silent = false): void {
+    const next = new Map<string, THREE.Matrix4>();
+    for (const [id, e] of Object.entries(all ?? {})) next.set(id, new THREE.Matrix4().fromArray(e));
+    let changed = false;
+    for (const id of new Set([...this.placements.keys(), ...next.keys()])) {
+      const before = this.placements.get(id) ?? new THREE.Matrix4();
+      const after = next.get(id) ?? new THREE.Matrix4();
+      if (before.equals(after)) continue;
+      changed = true;
+      if (!silent) this.onPlacementDelta(id, after.clone().multiply(before.clone().invert()));
+      const p = this.parts.get(id);
+      if (p && !(this.tcDrag && this.tcState?.id === id)) this.applyPlacement(p, next.get(id) ?? null);
+    }
+    this.placements = next;
+    if (changed) { if (this.tcState) this.startTransform(this.tcState.mode, this.tcState.id); this.placementChanged(); }
+  }
+
+  get transforming(): { mode: TransformMode; id: string } | null { return this.tcState; }
+
+  /** Show a move (XY plane) or rotate (about Z) handle on a part. */
+  startTransform(mode: TransformMode, id: string): boolean {
+    const p = this.parts.get(id);
+    if (!p) return false;
+    if (!this.tc) {
+      const tc = new TransformControls(this.cam, this.renderer.domElement);
+      tc.setSpace("world");
+      tc.setRotationSnap(THREE.MathUtils.degToRad(5));
+      tc.addEventListener("change", () => this.requestRender());
+      tc.addEventListener("dragging-changed", (e: any) => { this.nav.enabled = !e.value; });
+      tc.addEventListener("mouseDown", () => {
+        const cur = this.tcState && this.parts.get(this.tcState.id);
+        if (!cur) return;
+        this.tcProxy.updateMatrix();
+        this.tcDrag = { p0: this.tcProxy.matrix.clone(), g0: cur.mesh.matrix.clone() };
+      });
+      tc.addEventListener("objectChange", () => {
+        const cur = this.tcState && this.parts.get(this.tcState.id);
+        if (!cur || !this.tcDrag) return;
+        this.tcProxy.updateMatrix();
+        const m = this.tcProxy.matrix.clone().multiply(this.tcDrag.p0.clone().invert()).multiply(this.tcDrag.g0);
+        this.applyPlacement(cur, m);
+        this.overlayFollow(this.selectMesh, cur.info.id);
+        this.requestRender();
+      });
+      tc.addEventListener("mouseUp", () => {
+        const cur = this.tcState && this.parts.get(this.tcState.id);
+        const moved = cur && this.tcDrag && !cur.mesh.matrix.equals(this.tcDrag.g0);
+        this.tcDrag = null;
+        if (cur && moved) this.onPlacement(cur.info.id, Array.from(cur.mesh.matrix.elements));
+      });
+      const helper = tc.getHelper();
+      helper.traverse((o) => { o.userData.noAO = true; });
+      this.helpers.add(helper, this.tcProxy);
+      this.tc = tc;
+    }
+    const tc = this.tc;
+    (tc as any).camera = this.cam;
+    tc.setMode(mode === "move" ? "translate" : "rotate");
+    // Move in the build plane only; rotate about the vertical axis only.
+    tc.showX = mode === "move"; tc.showY = mode === "move"; tc.showZ = mode === "rotate";
+    this.tcProxy.position.copy(this.worldBox(p).getCenter(new THREE.Vector3()));
+    this.tcProxy.quaternion.identity();
+    this.tcProxy.updateMatrixWorld(true);
+    tc.attach(this.tcProxy);
+    this.tcState = { mode, id };
+    this.onTransformChange(this.tcState);
+    this.requestRender();
+    return true;
+  }
+
+  stopTransform(): void {
+    if (!this.tcState) return;
+    this.tc?.detach();
+    this.tcState = null;
+    this.tcDrag = null;
+    this.nav.enabled = true;
+    this.onTransformChange(null);
+    this.requestRender();
+  }
+
+  private currentMatrix(id: string): THREE.Matrix4 {
+    return this.parts.get(id)?.mesh.matrix.clone() ?? new THREE.Matrix4();
+  }
+
+  /** Rotate the part so the face with world normal `n` faces down, then set it on the bed (z = 0). */
+  layFlat(id: string, n: THREE.Vector3): void {
+    const p = this.parts.get(id);
+    if (!p) return;
+    const q = new THREE.Quaternion().setFromUnitVectors(n.clone().normalize(), new THREE.Vector3(0, 0, -1));
+    const c = this.worldBox(p).getCenter(new THREE.Vector3());
+    const rot = new THREE.Matrix4().makeTranslation(c.x, c.y, c.z)
+      .multiply(new THREE.Matrix4().makeRotationFromQuaternion(q))
+      .multiply(new THREE.Matrix4().makeTranslation(-c.x, -c.y, -c.z));
+    const m = rot.multiply(this.currentMatrix(id));
+    this.onPlacement(id, Array.from(this.dropped(p, m).elements));
+  }
+
+  /** Move the part straight down (or up) so it rests on the bed (z = 0). */
+  dropToBed(id: string): void {
+    const p = this.parts.get(id);
+    if (p) this.onPlacement(id, Array.from(this.dropped(p, this.currentMatrix(id)).elements));
+  }
+
+  resetPlacement(id: string): void {
+    if (this.parts.has(id)) this.onPlacement(id, null);
+  }
+
+  private dropped(p: PartObj, m: THREE.Matrix4): THREE.Matrix4 {
+    const g = p.mesh.geometry;
+    if (!g.boundingBox) g.computeBoundingBox();
+    // Exact lowest point: transform the vertices, not just the box corners (rotations widen boxes).
+    const pos = g.getAttribute("position") as THREE.BufferAttribute;
+    const v = new THREE.Vector3();
+    let minZ = Infinity;
+    for (let i = 0; i < pos.count; i++) { v.fromBufferAttribute(pos, i).applyMatrix4(m); if (v.z < minZ) minZ = v.z; }
+    return new THREE.Matrix4().makeTranslation(0, 0, -minZ).multiply(m);
   }
 
   dispose(): void {

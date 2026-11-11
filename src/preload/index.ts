@@ -24,9 +24,21 @@ const api = {
     setQuality: (q: string) => ipcRenderer.invoke("project:setQuality", q),
     reveal: (rel: string) => ipcRenderer.invoke("project:reveal", rel),
     installMcp: () => ipcRenderer.invoke("project:installMcp"),
+    importPaths: (paths: string[], destDir?: string): Promise<string[]> => ipcRenderer.invoke("project:import", paths, destDir),
+    importDialog: (destDir?: string): Promise<string[]> => ipcRenderer.invoke("project:importDialog", destDir),
+    remove: (rels: string[]): Promise<number> => ipcRenderer.invoke("project:delete", rels),
     onOpened: on("project:opened"),
     onChanged: on("project:changed"),
     onInfo: on("project:info"),
+  },
+  history: {
+    undo: (): Promise<string | null> => ipcRenderer.invoke("history:undo"),
+    redo: (): Promise<string | null> => ipcRenderer.invoke("history:redo"),
+    state: () => ipcRenderer.invoke("history:state"),
+    onState: on("history:state"),
+  },
+  placement: {
+    set: (id: string, matrix: number[] | null) => ipcRenderer.invoke("placement:set", id, matrix),
   },
   cad: {
     build: () => ipcRenderer.invoke("cad:build"),

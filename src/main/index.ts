@@ -1,7 +1,7 @@
 // Electron main process: window, display backend, project, CAD worker, agents, MCP hub, IPC.
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import type { AgentEvent, AgentKind, PermissionDecision, SnapshotRequest } from "../shared/types";
 import { AgentSession } from "./agents/base";
 import { claudeAuthStatus, claudeLogin, codexAuthStatus, codexLogin, writeLoginInput } from "./agents/auth";
@@ -12,6 +12,8 @@ import { Annotations } from "./annotations";
 import { Builder } from "./builder";
 import { CadWorker } from "./cadWorker";
 import { integrateDesktop } from "./desktopIntegration";
+import { downloadReference } from "./download";
+import { History, type Op } from "./history";
 import { McpHub } from "./mcpHub";
 import { CAD_EXT, isCadScript, Project, type ProjectOptions } from "./project";
 import { getSettings, rememberProject, setSettings } from "./settings";
@@ -87,6 +89,7 @@ if (!primaryInstance) app.exit(0);
 let win: BrowserWindow | null = null;
 let project: Project | null = null;
 let annotations: Annotations | null = null;
+let history: History | null = null;
 const worker = new CadWorker();
 const builder = new Builder(worker, () => project);
 const hub = new McpHub(app.getPath("userData"), process.env.SLASHCAD_USER_DATA ? "test" : "");
@@ -152,11 +155,121 @@ async function openPath(path: string, opts: ProjectOptions = {}): Promise<void> 
   }
 }
 
+// ---------------------------------------------------------------- files: import, delete, placement
+const MODEL_EXT = [".step", ".stp", ".brep", ".sc"];
+
+/** Yes/no question; test profiles (SLASHCAD_USER_DATA + SLASHCAD_TEST_AUTOCONFIRM) answer yes. */
+async function confirmBox(opts: Electron.MessageBoxOptions): Promise<boolean> {
+  if (process.env.SLASHCAD_USER_DATA && process.env.SLASHCAD_TEST_AUTOCONFIRM) return true;
+  return (await dialog.showMessageBox(win!, opts)).response === 0;
+}
+
+/** A project-relative path that does not exist yet: "name.ext", "name (2).ext", … */
+function freeName(p: Project, rel: string): string {
+  if (!existsSync(p.abs(rel))) return rel;
+  const ext = extname(rel), stem = rel.slice(0, rel.length - ext.length);
+  for (let i = 2; ; i++) { const c = `${stem} (${i})${ext}`; if (!existsSync(p.abs(c))) return c; }
+}
+
+/** Default destination: models and scripts in the project root, everything else in references/. */
+function importFolderFor(name: string): string {
+  const lower = name.toLowerCase();
+  return MODEL_EXT.some((e) => lower.endsWith(e)) || lower.endsWith(".py") ? "" : "references";
+}
+
+function needFolderProject(): Project {
+  if (!project) throw new Error("No project is open.");
+  if (project.singleFile) throw new Error("Only one file is open. Click \"Make project\" first to import or delete files.");
+  return project;
+}
+
+/** Copy files or folders into the project (one undo step). Models are added to the scene. */
+function importPaths(paths: string[], destDir?: string): string[] {
+  const p = needFolderProject();
+  const h = history!;
+  const done: string[] = [];
+  h.group(`import ${paths.length} item(s)`, (ops: Op[]) => {
+    for (const src of paths) {
+      const name = basename(src);
+      const folder = destDir ?? importFolderFor(name);
+      const rel = freeName(p, folder ? `${folder}/${name}` : name);
+      const abs = p.abs(rel);
+      mkdirSync(dirname(abs), { recursive: true });
+      if (statSync(src).isDirectory()) cpSync(src, abs, { recursive: true }); else copyFileSync(src, abs);
+      ops.push({ kind: "file", path: rel, stash: h.stashPath(rel), present: true });
+      done.push(rel);
+    }
+    const models = done.filter((r) => MODEL_EXT.some((e) => r.toLowerCase().endsWith(e)));
+    if (models.length) p.setScene([...p.info.scene, ...models]);
+  });
+  if (done.some((r) => MODEL_EXT.some((e) => r.toLowerCase().endsWith(e)))) builder.request("scene").catch(() => {});
+  return done;
+}
+
+/** Move files to .slashcad/trash after a confirmation (one undo step). */
+async function deletePaths(rels: string[]): Promise<number> {
+  const p = needFolderProject();
+  const list = [...new Set(rels)].filter((r) => r && !r.split("/").some((seg) => seg === ".slashcad" || seg === ".git") && existsSync(p.abs(r)));
+  // Drop entries inside a folder that is deleted too.
+  const top = list.filter((r) => !list.some((o) => o !== r && r.startsWith(o + "/")));
+  if (!top.length) return 0;
+  const yes = await confirmBox({
+    type: "question", buttons: ["Delete", "Cancel"], defaultId: 0, cancelId: 1,
+    message: top.length === 1 ? `Delete ${top[0]}?` : `Delete ${top.length} items?`,
+    detail: (top.length > 1 ? top.slice(0, 12).join("\n") + (top.length > 12 ? "\n…" : "") + "\n\n" : "") + "Ctrl+Z restores them.",
+  });
+  if (!yes) return 0;
+  const h = history!;
+  h.group(top.length === 1 ? `delete ${basename(top[0])}` : `delete ${top.length} items`, (ops: Op[]) => {
+    for (const rel of top) {
+      const stash = h.stashPath(rel);
+      mkdirSync(dirname(stash), { recursive: true });
+      p.setSnapshot(rel, null);
+      renameSync(p.abs(rel), stash);
+      ops.push({ kind: "file", path: rel, stash, present: false });
+    }
+    const gone = (s: string) => top.some((t) => s === t || s.startsWith(t + "/"));
+    if (p.info.scene.some(gone)) p.setScene(p.info.scene.filter((s) => !gone(s)));
+  });
+  builder.request("scene").catch(() => {});
+  return top.length;
+}
+
+function pushPlacements(): void {
+  if (!project) return;
+  worker.request("set_placements", { placements: project.info.placements ?? {} }).catch(() => {});
+}
+
+/** fetch_reference: ask the user, download into the project, record it for undo. */
+async function fetchReference(url: string, filename: string | undefined, folder: string | undefined, agentName: string): Promise<{ path: string; bytes: number; sha256: string; contentType: string }> {
+  const p = needFolderProject();
+  const dir = (folder ?? "references").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (dir.split("/").some((seg) => seg === ".." || seg === ".slashcad" || seg === ".git")) throw new Error("invalid folder");
+  const ok = await confirmBox({
+    type: "question", buttons: ["Download", "Cancel"], defaultId: 0, cancelId: 1,
+    message: `${agentName} wants to download a file into the project`,
+    detail: `${url}\n\n→ ${dir || "(project folder)"}/${filename ?? "(name from the download)"}\n\nOnly data files are accepted (STEP, STL, PDF, images …); they are never run.`,
+  });
+  if (!ok) throw new Error("The user declined the download.");
+  const d = await downloadReference(url, filename);
+  const rel = freeName(p, dir ? `${dir}/${d.name}` : d.name);
+  const abs = p.abs(rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, d.data);
+  history?.push(`download ${d.name}`, [{ kind: "file", path: rel, stash: history.stashPath(rel), present: true }]);
+  return { path: rel, bytes: d.data.length, sha256: d.sha256, contentType: d.contentType };
+}
+
 function openProject(dir: string, opts: ProjectOptions = {}): void {
   project?.dispose();
+  history?.removeAllListeners();
   stopAgent();
   builder.reset();
   project = new Project(dir, opts);
+  history = new History(project);
+  history.on("state", (st) => send("history:state", st));
+  history.on("applied", (a: { scene: boolean }) => { if (a.scene) builder.request("scene").catch(() => {}); });
+  project.on("placement-changed", () => pushPlacements());
   annotations?.removeAllListeners();
   annotations = new Annotations(project.stateDir);
   annotations.on("changed", (list) => send("annotations:changed", list));
@@ -169,6 +282,7 @@ function openProject(dir: string, opts: ProjectOptions = {}): void {
   project.on("info", (info) => { send("project:info", info); send("params:changed", readParams(project!)); });
   project.startWatching();
   send("project:opened", { info: project.info, tree: project.tree() });
+  send("history:state", history.state());
   send("annotations:changed", annotations.list());
   send("params:changed", readParams(project));
 }
@@ -350,6 +464,23 @@ function registerIpc(): void {
     return true;
   });
 
+  ipcMain.handle("history:undo", () => history?.undo() ?? null);
+  ipcMain.handle("history:redo", () => history?.redo() ?? null);
+  ipcMain.handle("history:state", () => history?.state() ?? { undo: null, redo: null });
+  ipcMain.handle("project:import", (_e, paths: string[], destDir?: string) => importPaths(paths, destDir));
+  ipcMain.handle("project:importDialog", async (_e, destDir?: string) => {
+    needFolderProject();
+    const r = await dialog.showOpenDialog(win!, { properties: ["openFile", "multiSelections"], title: "Import files into the project" });
+    if (r.canceled || !r.filePaths.length) return [];
+    return importPaths(r.filePaths, destDir);
+  });
+  ipcMain.handle("project:delete", (_e, rels: string[]) => deletePaths(rels));
+  ipcMain.handle("placement:set", (_e, id: string, matrix: number[] | null) => {
+    if (!project) return false;
+    project.setPlacement(id, matrix);
+    return true;
+  });
+
   ipcMain.handle("cad:build", () => builder.request("manual"));
   ipcMain.handle("cad:restartWorker", () => { worker.restart(); return true; });
   ipcMain.handle("cad:mesh", (_e, path: string) => {
@@ -438,6 +569,7 @@ app.whenReady().then(async () => {
     builder, worker, project: () => project, snapshot, annotations: () => annotations,
     highlight: (ids, message) => send("viewer:highlight", { ids, message }),
     sceneChanged: () => project && send("project:info", project.info),
+    fetchReference: (url, filename, folder) => fetchReference(url, filename, folder, agent?.kind === "codex" ? "ChatGPT (Codex)" : "Claude"),
   });
   // The CAD tools for agents must never keep the window from opening.
   try { await hub.start(); } catch (e) { console.error("MCP hub:", e); }
@@ -464,6 +596,12 @@ app.whenReady().then(async () => {
           console.log("[test] selected", JSON.stringify(sel));
           if (sel && sel.face >= 0) console.log("[test] face_info", JSON.stringify(await worker.request("face_info", { id: sel.partId, face: sel.face })));
           await new Promise((r) => setTimeout(r, 1500));
+        }
+        // SLASHCAD_TEST_SCRIPT=<file.js>: an async function body run in the window; its result is logged.
+        if (process.env.SLASHCAD_TEST_SCRIPT && process.env.SLASHCAD_USER_DATA) {
+          const body = readFileSync(process.env.SLASHCAD_TEST_SCRIPT, "utf8");
+          const out = await win!.webContents.executeJavaScript(`(async () => { ${body}\n })()`);
+          console.log("[test] script", JSON.stringify(out));
         }
         const img = await win!.webContents.capturePage();
         writeFileSync(shot, img.toPNG());

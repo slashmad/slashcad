@@ -74,8 +74,9 @@ flowchart LR
 2. **CAD tools over MCP.** Each agent session gets SlashCAD's MCP server (`slashcad`) with these tools:
    `build`, `get_scene`, `set_scene`, `inspect` (volume, area, bounding box, centre of mass, validity),
    `measure` (distance or interference between parts), `render_view` (a PNG from any standard view,
-   without moving your camera), `highlight`, `export` (STEP/STL/GLB/BREP), `list_annotations` and
-   `resolve_annotation`.
+   without moving your camera), `highlight`, `export` (STEP/STL/GLB/BREP), `fetch_reference`
+   (download a datasheet or vendor model into `references/` after you confirm), `list_annotations`
+   and `resolve_annotation`.
 3. **CAD worker.** A resident Python process (bundled CPython 3.13 with build123d and OpenCascade)
    runs the scripts. It caches STEP imports as BREP and meshes each part. It sends only changed parts
    to the view, together with B-rep edges and face ranges, so picking selects real CAD faces.
@@ -141,6 +142,31 @@ show(plate, name="plate", color="steelblue")
 scene. `load_step("model.step")` from `slashcad` returns an existing STEP model as a cached
 build123d shape, so new parts can be fitted to it.
 
+## Files, undo and placement
+
+- **Undo and redo.** `Ctrl+Z` and `Ctrl+Shift+Z` (or `Ctrl+Y`), or the ↶ ↷ buttons in the top bar,
+  step back and forth through:
+  - file edits, by you, the agent or another editor;
+  - imports and deletions;
+  - changes to the shown files;
+  - part placements.
+- **Import.** Use *Import…* in the Files tab, or drop files on the window or onto a folder in the
+  tree.
+  - Models and scripts go into the project folder, and models are shown at once.
+  - Other material (datasheets, drawings, photos) goes into `references/`, where the agent can read it.
+- **Delete.** Select files with click, Ctrl-click or Shift-click, then press `Delete` or use the
+  button. Deleted files move to `.slashcad/trash`, so `Ctrl+Z` restores them.
+- **Reference downloads.** Ask the agent to find a datasheet or a vendor STEP model. It downloads
+  the file into `references/` with the `fetch_reference` tool after you confirm the download.
+- **Placement, like in a slicer.** Select a part, then:
+  - **Move** drags it in the XY plane.
+  - **Rotate** turns it about Z in 5° steps.
+  - **Lay flat** puts the selected face on the bed.
+  - **To bed** sets the part down at Z = 0.
+
+  Placements are stored in the project. Measuring, export and the agent's tools all use the placed
+  part, so a part laid flat exports ready for printing.
+
 ## Privacy and safety
 
 - **Local only.** No telemetry, no accounts, no cloud service of its own. The app makes no network
@@ -154,8 +180,12 @@ build123d shape, so new parts can be fitted to it.
   a newly opened folder runs nothing until you click *Trust and build*. A new folder only offers
   scripts that import build123d/CadQuery as models, and STEP files can always be viewed. Single files
   (*Open file…*) keep all their state in the app's data folder, so nothing is written next to them.
-- **Agents stay in the project.** They are told to work only inside the project folder, and file
-  edits and commands go through the approval cards (unless you allow them).
+- **Agents stay in the project.** They are told to work only inside the project folder. File edits
+  and commands go through the approval cards unless you allow them. Memories an agent kept from
+  other projects do not apply unless you confirm them.
+- **Downloads only with your consent.** Every `fetch_reference` download asks you first. Only
+  public http(s) addresses and data file types (models, PDF, images, text) are accepted, up to
+  200 MB, and downloaded files are never run.
 
 ## SolidCraft (optional)
 

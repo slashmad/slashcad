@@ -3,7 +3,7 @@ import type { BuildResult, BuildState, ProjectInfo, Settings } from "../../share
 import { api } from "../api";
 import { useT } from "../i18n";
 import type { NavTool } from "../viewer/navigation";
-import type { DisplayMode, SectionAxis, Selection, Viewer } from "../viewer/Viewer";
+import type { DisplayMode, SectionAxis, Selection, TransformMode, Viewer } from "../viewer/Viewer";
 
 interface Props {
   viewer: Viewer | null;
@@ -40,12 +40,14 @@ export function ViewerPane(p: Props) {
   const [errOpen, setErrOpen] = useState(true);
   const [menu, setMenu] = useState<"export" | "views" | "display" | null>(null);
   const [, force] = useState(0);
+  const [xform, setXform] = useState<{ mode: TransformMode; id: string } | null>(null);
   const lastErrBuild = useRef(0);
 
   useEffect(() => {
     if (!v) return;
     v.onFrame = (f) => setFps(f);
     v.onMeasure = (d) => setMeasure(d ? `${d.dist.toFixed(3)} mm` : null);
+    v.onTransformChange = (t) => setXform(t);
     v.onContextMenu = (x, y, hit) => {
       const r = p.mountRef.current?.getBoundingClientRect();
       setCtx({ x: x - (r?.left ?? 0), y: y - (r?.top ?? 0), hit });
@@ -63,7 +65,7 @@ export function ViewerPane(p: Props) {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!v || (e.target as HTMLElement)?.closest("textarea, input, select")) return;
+      if (!v || (e.target instanceof Element && e.target.closest("textarea, input, select"))) return;
       const k = e.key.toLowerCase();
       if (k === "f") v.fit(v.selection ? [v.selection.partId] : undefined);
       else if (k === "h" || e.key === "Home" || k === "0") v.setView("iso", true, true);
@@ -74,7 +76,10 @@ export function ViewerPane(p: Props) {
       else if (k === "m") { const on = !v.measuring; v.setMeasuring(on); setMeasuring(on); }
       else if (k === "p" && v.selection) p.onAddAnnotation(v.selection);
       else if (k === "r") setTool(tool === "orbit" ? "select" : "orbit");
-      else if (e.key === "Escape") { v.select(null); setTool("select"); if (v.measuring) { v.setMeasuring(false); setMeasuring(false); } }
+      else if (e.key === "Escape") {
+        if (v.transforming) { v.stopTransform(); return; }
+        v.select(null); setTool("select"); if (v.measuring) { v.setMeasuring(false); setMeasuring(false); }
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -87,6 +92,13 @@ export function ViewerPane(p: Props) {
 
   const setSec = (s: typeof section) => { setSection(s); v?.setSection(s.axis, s.offset, s.flip); };
   const sel = p.selection;
+  // Stop moving when another part is selected or the selection is cleared.
+  useEffect(() => { if (v?.transforming && sel?.partId !== v.transforming.id) v.stopTransform(); }, [sel?.partId]);
+  const toggleXform = (mode: TransformMode, id: string) => {
+    if (!v) return;
+    if (v.transforming?.mode === mode && v.transforming.id === id) v.stopTransform(); else v.startTransform(mode, id);
+  };
+  const placed = (id: string) => !!p.info?.placements?.[id];
   const selPart = sel ? p.build?.parts.find((x) => x.id === sel.partId) : null;
   const dims = selPart ? selPart.bbox[1].map((x, i) => (x - selPart.bbox[0][i]).toFixed(2)).join(" × ") : "";
   const modeLabel: Record<DisplayMode, string> = { "shaded-edges": t("mode.shaded-edges"), shaded: t("mode.shaded"), wire: t("mode.wire"), xray: t("mode.xray") };
@@ -138,6 +150,13 @@ export function ViewerPane(p: Props) {
                 {item(t("ctx.mark"), () => p.onAddAnnotation(ctx.hit!), "strong")}
                 {item(t("ctx.ask"), () => p.onAskAgent(`part "${part.name}" (id ${part.id}), face ${ctx.hit!.face}, point (${ctx.hit!.point.x.toFixed(2)}, ${ctx.hit!.point.y.toFixed(2)}, ${ctx.hit!.point.z.toFixed(2)}) mm`))}
                 {item(t("ctx.fitPart"), () => v?.fit([part.id]))}
+                <div className="menu-sep" />
+                {item(t("ctx.move"), () => { v?.selectPart(part.id); v?.startTransform("move", part.id); })}
+                {item(t("ctx.rotate"), () => { v?.selectPart(part.id); v?.startTransform("rotate", part.id); })}
+                {ctx.hit.face >= 0 && ctx.hit.normal && item(t("ctx.layFlat"), () => v?.layFlat(part.id, ctx.hit!.normal!))}
+                {item(t("ctx.drop"), () => v?.dropToBed(part.id))}
+                {placed(part.id) && item(t("ctx.resetPlace"), () => v?.resetPlacement(part.id))}
+                <div className="menu-sep" />
                 {item(t("ctx.hide"), () => p.onHide(part.id))}
                 {item(t("ctx.isolate"), () => p.onIsolate(part.id))}
                 {item(t("ctx.source"), () => p.onOpenSource(part.source, null))}
@@ -159,12 +178,13 @@ export function ViewerPane(p: Props) {
       )}
 
       {measuring && <div className="hint">{t("vp.measureHint", { m: measure ? ` · ${measure}` : "" })}</div>}
+      {xform && !measuring && <div className="hint low">{t(xform.mode === "move" ? "vp.moveHint" : "vp.rotateHint")}</div>}
       {p.toast && <div className="toast">{p.toast}</div>}
 
       {selPart && sel && (
         <div className="sel-card">
           <div className="sel-name">{selPart.name}</div>
-          <div className="muted small">{selPart.source}{sel.face >= 0 ? ` · ${t("vp.face", { n: sel.face })}` : ""} · {dims} mm</div>
+          <div className="muted small">{selPart.source}{sel.face >= 0 ? ` · ${t("vp.face", { n: sel.face })}` : ""} · {dims} mm{placed(selPart.id) ? ` · ${t("vp.placed")}` : ""}</div>
           <div className="sel-actions">
             <button className="primary" title={t("vp.markTitle")} onClick={() => p.onAddAnnotation(sel)}>{t("vp.mark")}</button>
             <button onClick={() => p.onAskAgent(`part "${selPart.name}" (id ${selPart.id})${sel.face >= 0 ? `, face ${sel.face}` : ""}, point (${sel.point.x.toFixed(2)}, ${sel.point.y.toFixed(2)}, ${sel.point.z.toFixed(2)}) mm`)}>{t("vp.ask")}</button>
@@ -172,6 +192,13 @@ export function ViewerPane(p: Props) {
             <button onClick={() => p.onHide(selPart.id)}>{t("vp.hide")}</button>
             <button onClick={() => p.onIsolate(selPart.id)}>{t("vp.isolate")}</button>
             <button onClick={() => p.onOpenSource(selPart.source, null)}>{t("vp.source")}</button>
+          </div>
+          <div className="sel-actions">
+            <button className={xform?.mode === "move" && xform.id === selPart.id ? "on" : ""} onClick={() => toggleXform("move", selPart.id)}>{t("vp.move")}</button>
+            <button className={xform?.mode === "rotate" && xform.id === selPart.id ? "on" : ""} onClick={() => toggleXform("rotate", selPart.id)}>{t("vp.rotate")}</button>
+            {sel.face >= 0 && sel.normal && <button title={t("vp.layFlatTitle")} onClick={() => v?.layFlat(selPart.id, sel.normal!)}>{t("vp.layFlat")}</button>}
+            <button title={t("vp.dropTitle")} onClick={() => v?.dropToBed(selPart.id)}>{t("vp.drop")}</button>
+            {placed(selPart.id) && <button onClick={() => v?.resetPlacement(selPart.id)}>{t("vp.resetPlace")}</button>}
           </div>
         </div>
       )}

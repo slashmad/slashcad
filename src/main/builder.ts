@@ -50,6 +50,7 @@ export class Builder extends EventEmitter {
           cache_dir: project.cacheDir,
           sources: project.buildableScene(),
           quality: project.info.quality,
+          placements: project.info.placements ?? {},
         }, getSettings().buildTimeoutSec * 1000);
         const result: BuildResult = { n: ++this.n, trigger, startedAt, ...res };
         return result;

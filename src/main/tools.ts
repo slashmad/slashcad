@@ -15,6 +15,7 @@ export interface ToolContext {
   snapshot(req: Omit<SnapshotRequest, "reqId">): Promise<string>; // data URL (PNG)
   highlight(ids: string[], message?: string): void;
   sceneChanged(): void;
+  fetchReference(url: string, filename?: string, folder?: string): Promise<{ path: string; bytes: number; sha256: string; contentType: string }>;
 }
 
 const text = (t: string, isError = false): ToolResult => ({ content: [{ type: "text", text: t }], isError });
@@ -41,6 +42,8 @@ export function buildSummary(r: BuildResult, project: Project): string {
   if (r.removed.length) lines.push(`Removed: ${r.removed.join(", ")}`);
   if (changed.length) lines.push(`Changed: ${changed.join(", ")}`);
   lines.push(`Scene: ${project.info.scene.join(", ") || "(empty)"}`);
+  const placed = Object.keys(project.info.placements ?? {});
+  if (placed.length) lines.push(`Placed by the user in the view (moved/rotated on top of the script's coordinates; sizes above, inspect, measure and export use the placed geometry): ${placed.slice(0, 40).join(", ")}${placed.length > 40 ? " …" : ""}`);
   if (project.singleFile) lines.push(`Single-file mode: only ${project.singleFile} is open (no project). To add geometry, ask the user to click "Make project" in the top bar.`);
   const blocked = project.info.trusted ? [] : project.info.scene.filter((s) => s.endsWith(".py"));
   if (blocked.length) lines.push(`NOTE: scripts are not run because the user has not trusted this folder yet: ${blocked.join(", ")}. Ask the user to click "Trust and build" in SlashCAD.`);
@@ -74,6 +77,24 @@ export function registerTools(hub: McpHub, ctx: ToolContext): void {
       return text(buildSummary(r, p), r.sources.some((s) => s.error));
     },
     summarize: (_a, r) => (r.isError ? "Build with errors" : "Build OK"),
+  });
+
+  hub.register("fetch_reference", {
+    description: "Download a reference file (datasheet PDF, drawing, image, or a vendor STEP/STL model) from a direct http(s) URL into the project, by default into references/. The user confirms every download in SlashCAD. Only data files are accepted: step, stp, iges, igs, brep, stl, 3mf, obj, sc, dxf, svg, pdf, png, jpg, jpeg, webp, gif, txt, md, csv, json. Web pages are refused: find the direct file link first. Downloaded models are not shown until you add them with set_scene.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "Direct http(s) link to the file." },
+        filename: { type: "string", description: "Optional file name with extension, e.g. 'IP67-box-datasheet.pdf' (use it when the URL has no file name)." },
+        folder: { type: "string", description: "Optional project-relative folder (default 'references')." },
+      },
+      required: ["url"],
+    },
+    async run(a) {
+      const r = await ctx.fetchReference(String(a.url ?? ""), a.filename ? String(a.filename) : undefined, a.folder !== undefined ? String(a.folder) : undefined);
+      return text(`Saved ${r.path} (${(r.bytes / 1024).toFixed(1)} KiB, ${r.contentType || "unknown type"}, sha256 ${r.sha256.slice(0, 16)}…).`);
+    },
+    summarize: (a, r) => (r.isError ? "Download refused or failed" : `Downloaded ${String(a.filename ?? a.url).split("/").pop()}`),
   });
 
   hub.register("set_scene", {
