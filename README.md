@@ -31,10 +31,10 @@ the agents' own traffic to their providers.
 └──────────────┴──────────────────────────────────────┴─────────────────────┘
 ```
 
-> **Status:** early development (0.3). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
-> Code. The Windows packages are cross-built and the macOS build exists only as a CI job: neither has
-> been tested on real hardware yet. Codex/ChatGPT support is implemented and connects, but has seen
-> less end-to-end use than Claude.
+> **Status:** early development (0.4). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
+> Code. ChatGPT (Codex) runs real turns in the app. Its approval of SlashCAD's CAD tools was fixed in
+> 0.4 and has not yet been checked in a live session. The Windows installer works; the portable exe
+> fix from 0.3.0-fix awaits confirmation, and the macOS build exists only as an untested CI job.
 
 ## What it is for
 
