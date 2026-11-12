@@ -99,6 +99,10 @@ const hub = new McpHub(app.getPath("userData"), process.env.SLASHCAD_USER_DATA ?
 let agent: AgentSession | null = null;
 const snapshotWaiters = new Map<string, { resolve: (u: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }>();
 
+// A closed stdout/stderr (a terminal or pipe that went away) must never become an error dialog:
+// console.log/error would otherwise throw EPIPE as an uncaught exception in the main process.
+for (const stream of [process.stdout, process.stderr]) stream?.on?.("error", () => {});
+
 const send = (channel: string, ...args: unknown[]) => { if (win && !win.isDestroyed()) win.webContents.send(channel, ...args); };
 
 function resourcePath(...p: string[]): string {

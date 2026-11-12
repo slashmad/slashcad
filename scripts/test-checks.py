@@ -66,7 +66,7 @@ r = checks.evaluate([item(slider), item(stop)], [
 ])
 got = {x["id"]: x for x in r["results"]}
 case("path free for 40 mm", got["free"]["status"] == "pass", got["free"]["detail"])
-case("path blocked within 60 mm, at the 53 mm gap", got["hit"]["status"] == "fail" and "53.0" in got["hit"]["detail"], got["hit"]["detail"])
+case("path blocked within 60 mm, at the 53 mm gap", got["hit"]["status"] == "fail" and " 53.0" in got["hit"]["detail"], got["hit"]["detail"])
 
 tray = part("tray", bd.Box(40, 30, 6) - bd.Pos(0, 0, 2) * bd.Box(36, 26, 6))
 phone = part("phone", bd.Pos(0, 0, 1.5) * bd.Box(35.6, 25.6, 3))

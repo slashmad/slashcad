@@ -21,15 +21,10 @@ It runs the `claude` and `codex` command-line tools you already use, with your e
 subscription. There are no API keys and no extra credits, and nothing leaves your machine except
 the agents' own traffic to their providers.
 
-```
-┌──────────────┬──────────────────────────────────────┬─────────────────────┐
-│ Files        │                                      │ Claude │ ChatGPT    │
-│ Model tree   │          live 3D CAD view            │ chat, tool calls,   │
-│ Parameters   │  (orbit · section · measure · mark)  │ approvals, tokens,  │
-│ Changes      │                                      │ usage limits,       │
-│ Builds       │                                      │ markers / tasks     │
-└──────────────┴──────────────────────────────────────┴─────────────────────┘
-```
+![SlashCAD with the example sliding-lid box: the Checks tab lists the design rules, the view previews the lid half open](docs/screenshots/rules.png)
+
+*The example box in `examples/slide-box`. Left: the project's design rules, all passing. Centre:
+the lid is previewed half open (`SLIDE = 45`) without changing the file. Right: the agent chat.*
 
 > **Status:** early development (0.5.1). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
 > Code. ChatGPT (Codex) runs real turns in the app. Its approval of SlashCAD's CAD tools was fixed in
@@ -204,7 +199,8 @@ The **Checks** tab has four parts. Agents use the same checks through their tool
   SlashCAD rebuilds the model at every step in memory, without changing the file, and reports the
   poses with interference or failed rules and the closest pairs. Only the listed poses are checked,
   not the motion between them. The *free path* and *retained* rules do check the whole travel: they
-  advance by the exact distance to the nearest part and probe every contact. Click a pose to see it in the view;
+  intersect the volume the part sweeps through, so even a thin edge cannot be skipped, and find the
+  first contact by bisection. Click a pose to see it in the view;
   a banner shows that the view is a preview, with a button to go back to the file.
 - **Print.** For your printer (*Settings › Printing*: bed, nozzle, layer, overhang limit, the fit
   clearance your printer achieves):
@@ -220,6 +216,13 @@ The **Checks** tab has four parts. Agents use the same checks through their tool
   measured values against nominal ones. Agents read it before changing a printed design and treat
   it as stronger evidence than any CAD check. They can log what you report in the chat after you
   confirm.
+
+| Motion study | Printability |
+|---|---|
+| ![Motion study: 21 poses of SLIDE checked, the lid previewed at 80 mm](docs/screenshots/motion.png) | ![Printability: the lid placed upside down shows its whole underside as overhang, and the check suggests flipping it](docs/screenshots/print.png) |
+| 21 lid positions checked in 8 s, previewing the pose at 80 mm. | The lid laid on its grip: the red underside is overhang, and the check suggests flipping it. |
+
+Open `examples/slide-box` to try the checks on the box shown above.
 
 `show(part, name="lid", material="petg")` gives a part a material colour and density. *inspect* then
 reports mass and the combined centre of mass. Add your own materials under `"materials"` in the

@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "rules": [
+    {"id": "lid-fit", "kind": "clearance", "a": "lid", "b": "base", "min": 0.15, "note": "sliding fit in the grooves"},
+    {"id": "lid-held", "kind": "retained", "part": "lid", "against": "base", "directions": [[0, 0, 1]], "within": 1, "note": "the lid must not lift out"},
+    {"id": "lid-slides-out", "kind": "path_clear", "part": "lid", "against": "base", "direction": [1, 0, 0], "distance": 130, "note": "the lid slides out of the open end"},
+    {"id": "divider-fit", "kind": "allow_contact", "a": "divider", "b": "base", "note": "divider rests on the floor"},
+    {"id": "box-size", "kind": "envelope", "parts": "base", "max": [125, 65, 32], "note": "fits the drawer"}
+  ],
+  "sweep": {"param": "SLIDE", "from": 0, "to": 100, "step": 5, "file": "main.py"}
+}

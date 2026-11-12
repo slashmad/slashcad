@@ -256,55 +256,104 @@ def _unit(v):
     return v / n
 
 
-PENETRATION_PROBE = 0.01  # mm: a contact blocks the motion if this much further travel overlaps
-PENETRATION_TOL = 1e-5   # mm³
+PENETRATION_TOL = 1e-5   # mm³: swept overlap below this is contact, not collision
+TRAVEL_TOL = 0.005       # mm: precision of the reported travel
 
 
-def travel_until_collision(shape, targets, direction, distance: float, resolution: float):
-    """Conservative advancement along `direction`: the first travel (mm) at which `shape` would
-    penetrate a target, or None if it stays free for the whole distance.
+def _swept(shape, u, length: float):
+    """Solid pieces of the volume a part passes through when translated by `length` along unit
+    vector `u`: the prisms of its boundary faces (with the part's start position, they cover the
+    whole swept volume). Faces parallel to the motion give empty prisms and are left out, so
+    sliding along a nearby wall is not a collision. Returns [(raw solid, box)]."""
+    from OCP.BRepGProp import BRepGProp
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
+    from OCP.GProp import GProp_GProps
+    from OCP.gp import gp_Vec
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_SOLID
+    from OCP.TopExp import TopExp_Explorer
 
-    Away from contact the step is the exact surface distance to the nearest target, so no obstacle
-    can be skipped (a translation by s changes every distance by at most s). In contact, a probe
-    of PENETRATION_PROBE mm decides whether the contact blocks the motion; contact that only slides
-    advances by `resolution`, which is the only place where a feature thinner than `resolution`
-    could be missed. Returns (travel, target_id, info)."""
+    v = u * length
+    vec = gp_Vec(float(v[0]), float(v[1]), float(v[2]))
+    pieces = []
+    shells = TopExp_Explorer(shape.wrapped, TopAbs_SHELL)
+    while shells.More():
+        prism = BRepPrimAPI_MakePrism(shells.Current(), vec, True)
+        prism.Build()
+        if not prism.IsDone():
+            raise RuntimeError("sweep failed")
+        ex = TopExp_Explorer(prism.Shape(), TopAbs_SOLID)
+        while ex.More():
+            solid = ex.Current()
+            g = GProp_GProps()
+            BRepGProp.VolumeProperties_s(solid, g)
+            if abs(g.Mass()) > 1e-9:
+                raw = _Raw(solid)
+                pieces.append((raw, _raw_box(raw)))
+            ex.Next()
+        shells.Next()
+    return pieces
+
+
+class _Raw:
+    """A bare OpenCascade shape (prism solids are used without a build123d wrapper)."""
+    def __init__(self, wrapped):
+        self.wrapped = wrapped
+
+
+def _raw_box(raw):
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    bb = Bnd_Box()
+    BRepBndLib.Add_s(raw.wrapped, bb, False)
+    lo, hi = bb.CornerMin(), bb.CornerMax()
+    return np.array([lo.X(), lo.Y(), lo.Z()]), np.array([hi.X(), hi.Y(), hi.Z()])
+
+
+def _first_hit(shape, tboxes, u, length: float):
+    """Id of a target that the swept volume of `length` overlaps, else None."""
+    pieces = _swept(shape, u, length)
+    for tp, ts, tb in tboxes:
+        for raw, pb in pieces:
+            if _box_gap(pb, tb) > 0:
+                continue
+            v = overlap_volume(raw, ts)
+            if v is None:
+                raise RuntimeError(f"could not intersect the swept volume with {tp.name}")
+            if v > PENETRATION_TOL:
+                return tp.id
+    return None
+
+
+def travel_until_collision(shape, targets, direction, distance: float, resolution: float = TRAVEL_TOL):
+    """Exact first contact along `direction`: the travel (mm) at which `shape` starts to overlap a
+    target, or None when it stays free for the whole distance. The whole path is checked as one
+    swept volume, so no obstacle between positions can be skipped; the travel of a hit is found by
+    bisection to `resolution`. Contact that only slides along a surface is not a collision.
+    Returns (travel, target_id, info)."""
     u = _unit(direction)
     if not distance > 0:
         raise ValueError("distance must be positive")
-    res = max(float(resolution), 1e-3)
-    d = 0.0
-    evals = 0
-    slid = False
+    tol = max(min(float(resolution), 0.05), 1e-4)
     tboxes = [(tp, ts, _box(ts)) for tp, ts in targets]
-    for _ in range(20000):
-        moved = _moved(shape, u * d)
-        mb = _box(moved)
-        remaining = distance - d
-        reach = [(tp, ts, tb) for tp, ts, tb in tboxes if _box_gap(mb, tb) <= remaining + 1e-9]
-        if not reach:
-            return None, None, {"evaluations": evals, "sliding_contact": slid}
-        step = remaining
-        for tp, ts, tb in reach:
-            evals += 1
-            if _box_gap(mb, tb) <= 1e-9:
-                v = overlap_volume(moved, ts)
-                if v is None or v > VOLUME_TOL:
-                    return d, tp.id, {"evaluations": evals, "sliding_contact": slid, "at_start": d == 0}
-            g = fast_distance(moved, ts, remaining + 1.0)
-            if g <= 1e-6:
-                probe = _moved(shape, u * (d + min(PENETRATION_PROBE, remaining)))
-                v = overlap_volume(probe, ts)
-                if v is None or v > PENETRATION_TOL:
-                    return d + min(PENETRATION_PROBE, remaining), tp.id, {"evaluations": evals, "sliding_contact": slid, "at_start": d == 0}
-                slid = True
-                step = min(step, res)
-            else:
-                step = min(step, g)
-        if d >= distance - 1e-12:
-            return None, None, {"evaluations": evals, "sliding_contact": slid}
-        d = min(distance, d + max(step, 1e-4))
-    raise RuntimeError("motion check did not converge")
+    for tp, ts, tb in tboxes:  # already overlapping before moving
+        if _box_gap(_box(shape), tb) <= 0:
+            v = overlap_volume(shape, ts)
+            if v is not None and v > VOLUME_TOL:
+                return 0.0, tp.id, {"at_start": True, "method": "swept volume"}
+    hit = _first_hit(shape, tboxes, u, distance)
+    if hit is None:
+        return None, None, {"method": "swept volume"}
+    lo, hi, evals = 0.0, distance, 1
+    while hi - lo > tol:
+        mid = (lo + hi) / 2
+        h = _first_hit(shape, tboxes, u, mid)
+        evals += 1
+        if h is None:
+            lo = mid
+        else:
+            hi, hit = mid, h
+    return hi, hit, {"method": "swept volume", "evaluations": evals, "resolution": tol}
 
 
 # ---------------------------------------------------------------- rules
@@ -411,17 +460,16 @@ def evaluate(items, rules: list, near: float = 0.5, deadline=None) -> dict:
                     continue
                 dirs = r.get("directions") or ([r["direction"]] if r.get("direction") else [[0, 0, 1]])
                 dist = float(r.get("within" if kind == "retained" else "distance", 2.0 if kind == "retained" else 10.0))
-                res = float(r.get("step", 0.05))
+                res = float(r.get("step", TRAVEL_TOL))
                 if not dist > 0 or not res > 0:
                     raise ValueError("distance/within and step must be positive")
-                fails, notes, slid = [], [], False
+                fails, notes = [], []
                 for mp, ms in movers:
                     targets = [(p, s) for p, s in targets_all if p.id != mp.id]
                     for d in dirs:
                         dn = axis_name(d)
-                        travel, hit, info = travel_until_collision(ms, targets, d, dist + (PENETRATION_PROBE if kind == "retained" else 0), res)
-                        slid = slid or info.get("sliding_contact", False)
-                        start = " (already overlapping at the start pose)" if info.get("at_start") and travel is not None and travel <= PENETRATION_PROBE else ""
+                        travel, hit, info = travel_until_collision(ms, targets, d, dist, res)
+                        start = " (already overlapping at the start pose)" if info.get("at_start") else ""
                         if kind == "retained":
                             if travel is None or travel > dist + 1e-9:
                                 fails.append(f"{mp.name} moves {dist} mm along {dn} without being caught")
@@ -432,7 +480,7 @@ def evaluate(items, rules: list, near: float = 0.5, deadline=None) -> dict:
                                 fails.append(f"{mp.name} hits {hit.split('#')[-1]} after {travel:.3f} mm along {dn}{start}")
                             else:
                                 notes.append(f"{mp.name} free for {dist} mm along {dn}")
-                method = (f"continuous check; sliding contact sampled every {res:g} mm" if slid else "continuous check")
+                method = f"swept-volume check, travel to {min(res, 0.05):g} mm"
                 results.append({"id": rid, "kind": kind, "status": "fail" if fails else "pass",
                                 "detail": ("; ".join(fails or notes)[:560] + f" [{method}]"), "parts": [p.id for p, _ in movers], "rule": r})
         except Exception as e:  # noqa: BLE001
