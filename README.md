@@ -26,7 +26,7 @@ the agents' own traffic to their providers.
 *The example box in `examples/slide-box`. Left: the project's design rules, all passing. Centre:
 the lid is previewed half open (`SLIDE = 45`) without changing the file. Right: the agent chat.*
 
-> **Status:** early development (0.5.1). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
+> **Status:** early development (0.5.2). Daily use on Linux (Fedora, GNOME, Wayland) with Claude
 > Code. ChatGPT (Codex) runs real turns in the app. Its approval of SlashCAD's CAD tools was fixed in
 > 0.4 and has not yet been checked in a live session. The design checks of 0.5 are tested in the app
 > and through the MCP tools, but not yet in a real agent session. The Windows installer works; the portable exe
@@ -233,8 +233,10 @@ rules file. STEP and 3MF exports carry part names, so slicers list the parts by 
 - **Local only.** No telemetry, no accounts, no cloud service of its own. The app makes no network
   requests itself. Even Chromium's spell-check dictionary download is disabled.
 - **No API billing.** `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and similar variables are removed
-  from the agents' environment. If Claude Code is logged in with a Console/API account, the app warns
-  you that it would bill the API instead of your subscription.
+  from the agents' environment. Before every session and every message, SlashCAD asks the CLI for
+  its login status and only runs the agent on a subscription login (Claude: claude.ai; Codex:
+  ChatGPT). An API/Console login, no login or an unreadable status stops the agent with a message
+  instead. Only the CLI's own status output is read, never its credential files.
 - **No stored credentials.** SlashCAD never reads the agents' credential files. Login is handled by
   the agents' own login flows.
 - **Scripts run only in folders you trust.** Python model scripts are executed by the CAD worker, so
@@ -315,7 +317,8 @@ node scripts/setup-python.mjs --bundle --target win
 npm run dist:win                                 # NSIS installer, portable exe, zip
 ```
 
-`npm run test:checks` runs the regression tests for the design checks (synthetic geometry only).
+`npm test` runs the regression tests: the design checks on synthetic geometry (`test:checks`) and the
+main-process safety rules (`test:main`: rules files, subscription login, project trust).
 
 `npm run icon` copies the icon set from `build/SlashCAD-transparent-icons` to the places the build
 uses. `npm run notices` regenerates `THIRD-PARTY-NOTICES.md` after dependency changes.

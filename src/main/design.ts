@@ -28,12 +28,26 @@ export function readDesign(p: Project): DesignFile {
   try { text = readFileSync(rulesPath(p), "utf8"); } catch { return { version: 1, rules: [] }; } // no rules file
   try {
     const j = JSON.parse(text);
-    const all: any[] = Array.isArray(j.rules) ? j.rules : [];
-    const rules = all.filter((r) => r && KINDS.includes(r.kind));
-    const bad = all.filter((r) => !(r && KINDS.includes(r.kind)));
+    if (!j || typeof j !== "object" || Array.isArray(j)) throw new Error("the file is not a JSON object");
+    if (j.version !== undefined && j.version !== 1) {
+      return { version: 1, rules: [], error: `${RULES_FILE} has version ${JSON.stringify(j.version)}, which this SlashCAD does not know; no rules were checked`, unreadable: true };
+    }
+    if (j.rules !== undefined && !Array.isArray(j.rules)) throw new Error('"rules" must be a list');
+    const all: any[] = j.rules ?? [];
+    const rules: DesignRule[] = [];
+    const problems: string[] = [];
+    all.forEach((r, i) => {
+      try {
+        validateRule(r);
+        rules.push(r.id ? r : { ...r, id: `${r.kind}-${i + 1}` });
+      } catch (e: any) {
+        problems.push(`rule ${i + 1}${r?.id ? ` (${r.id})` : ""}: ${e?.message ?? e}`);
+      }
+    });
     return {
       version: 1, rules, materials: j.materials && typeof j.materials === "object" ? j.materials : undefined, sweep: j.sweep,
-      ...(bad.length ? { error: `${bad.length} rule(s) with an unknown kind were not checked: ${bad.map((r) => JSON.stringify(r?.kind ?? r)).slice(0, 5).join(", ")}` } : {}),
+      // Invalid rules are not dropped silently: the check reports them as a failure.
+      ...(problems.length ? { error: `${problems.length} rule(s) in ${RULES_FILE} are invalid and were not checked: ${problems.slice(0, 5).join("; ")}${problems.length > 5 ? " …" : ""}` } : {}),
     };
   } catch (e: any) {
     // A broken file must never read as "no rules": that would turn every check into a pass.
@@ -43,7 +57,8 @@ export function readDesign(p: Project): DesignFile {
 
 function writable(p: Project): DesignFile {
   const d = readDesign(p);
-  if (d.unreadable) throw new Error(`${d.error}. Fix the file by hand first; SlashCAD will not overwrite it.`);
+  // Rewriting would drop what could not be read: leave the user's file untouched until it is fixed.
+  if (d.error) throw new Error(`${d.error}. Fix the file by hand first; SlashCAD will not overwrite it.`);
   return d;
 }
 
@@ -57,19 +72,55 @@ function writeDesign(p: Project, d: DesignFile): void {
 }
 
 /** Check a rule from an agent or the UI; returns a cleaned copy with an id. */
-export function normaliseRule(r: any, existing: DesignRule[]): DesignRule {
+/** Throws when a rule lacks a field its kind needs or has a field of the wrong type. Used for rules
+ *  written by hand as well as rules added through the app, so a typo never becomes a silent pass. */
+export function validateRule(r: any): void {
   if (!r || typeof r !== "object") throw new Error("a rule must be an object");
-  if (!KINDS.includes(r.kind)) throw new Error(`unknown rule kind ${r.kind}; use one of ${KINDS.join(", ")}`);
-  const need = (k: string) => { if (r[k] === undefined || r[k] === null || r[k] === "") throw new Error(`a ${r.kind} rule needs "${k}"`); };
-  const num = (k: string) => { if (r[k] !== undefined && !Number.isFinite(Number(r[k]))) throw new Error(`"${k}" must be a number`); };
+  if (!KINDS.includes(r.kind)) throw new Error(`unknown rule kind ${JSON.stringify(r.kind)}; use one of ${KINDS.join(", ")}`);
+  const need = (k: string) => { if (r[k] === undefined || r[k] === null || r[k] === "" || (Array.isArray(r[k]) && !r[k].length)) throw new Error(`a ${r.kind} rule needs "${k}"`); };
+  const num = (k: string, positive = false) => {
+    if (r[k] === undefined) return;
+    const v = Number(r[k]);
+    if (typeof r[k] === "boolean" || !Number.isFinite(v)) throw new Error(`"${k}" must be a number`);
+    if (positive && !(v > 0)) throw new Error(`"${k}" must be above 0`);
+  };
+  const vec = (v: unknown, what: string) => {
+    if (!Array.isArray(v) || v.length !== 3 || !v.every((x) => Number.isFinite(Number(x))) || v.every((x) => Number(x) === 0)) throw new Error(`"${what}" must be a non-zero [x, y, z]`);
+  };
+  const globs = (k: string) => { if (r[k] !== undefined && typeof r[k] !== "string" && !(Array.isArray(r[k]) && r[k].every((x: unknown) => typeof x === "string"))) throw new Error(`"${k}" must be a name pattern or a list of them`); };
+  ["a", "b", "part", "parts", "against"].forEach(globs);
+  num("step", true);
   switch (r.kind) {
-    case "clearance": need("a"); need("b"); need("min"); num("min"); break;
+    case "clearance": need("a"); need("b"); need("min"); num("min"); if (Number(r.min) < 0) throw new Error('"min" must not be negative'); break;
     case "allow_contact": need("a"); need("b"); break;
-    case "envelope": need("max"); if (!Array.isArray(r.max) || r.max.length !== 3) throw new Error('"max" must be [x, y, z] (null for no limit)'); break;
-    case "protected": need("fingerprints"); break;
-    case "retained": need("part"); need("within"); num("within"); break;
-    case "path_clear": need("part"); need("distance"); num("distance"); if (!r.direction && !r.directions) throw new Error('a path_clear rule needs "direction" [x, y, z]'); break;
+    case "envelope":
+      need("max");
+      if (!Array.isArray(r.max) || r.max.length !== 3 || !r.max.every((x: unknown) => x === null || Number.isFinite(Number(x)))) throw new Error('"max" must be [x, y, z] (null for no limit)');
+      if (r.max.every((x: unknown) => x === null)) throw new Error('"max" needs at least one limit');
+      break;
+    case "protected":
+      need("fingerprints");
+      if (typeof r.fingerprints !== "object" || Array.isArray(r.fingerprints) || !Object.keys(r.fingerprints).length) throw new Error('"fingerprints" must name at least one part');
+      break;
+    case "retained":
+      need("part"); need("within"); num("within", true);
+      if (r.directions !== undefined) { if (!Array.isArray(r.directions) || !r.directions.length) throw new Error('"directions" must be a list of [x, y, z]'); r.directions.forEach((d: unknown) => vec(d, "directions")); }
+      if (r.direction !== undefined) vec(r.direction, "direction");
+      break;
+    case "path_clear":
+      need("part"); need("distance"); num("distance", true);
+      if (!r.direction && !r.directions) throw new Error('a path_clear rule needs "direction" [x, y, z]');
+      if (r.direction !== undefined) vec(r.direction, "direction");
+      if (r.directions !== undefined) { if (!Array.isArray(r.directions) || !r.directions.length) throw new Error('"directions" must be a list of [x, y, z]'); r.directions.forEach((d: unknown) => vec(d, "directions")); }
+      break;
+    case "interference":
+      if (r.enabled !== undefined && typeof r.enabled !== "boolean") throw new Error('"enabled" must be true or false');
+      break;
   }
+}
+
+export function normaliseRule(r: any, existing: DesignRule[]): DesignRule {
+  validateRule(r);
   const base = String(r.id || `${r.kind}-${(r.a ?? r.part ?? r.parts ?? "all").toString().replace(/[^A-Za-z0-9_-]+/g, "").slice(0, 24) || "rule"}`);
   let id = base;
   for (let i = 2; existing.some((e) => e.id === id); i++) id = `${base}-${i}`;

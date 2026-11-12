@@ -1,7 +1,7 @@
 {
   "name": "slashcad",
   "productName": "SlashCAD",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "description": "Local CAD workbench where AI agents (Claude, Codex) build build123d models while you watch and steer.",
   "author": "slashmad",
   "license": "MIT",
@@ -20,7 +20,9 @@
     "dist:mac": "npm run build && electron-builder --mac dmg zip",
     "notices": "node scripts/third-party-notices.mjs",
     "icon": "node scripts/sync-icons.mjs",
-    "test:checks": ".venv/bin/python -I scripts/test-checks.py"
+    "test:checks": ".venv/bin/python -I scripts/test-checks.py",
+    "test:main": "node scripts/test-main.mjs",
+    "test": "npm run -s test:main && npm run -s test:checks"
   },
   "dependencies": {
     "react": "19.1.10",

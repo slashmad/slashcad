@@ -4,7 +4,8 @@ import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync,
 import { basename, dirname, extname, join, relative, resolve, sep } from "node:path";
 import type { AgentEvent, AgentKind, PermissionDecision, PosePreview, SnapshotRequest } from "../shared/types";
 import { AgentSession } from "./agents/base";
-import { claudeAuthStatus, claudeLogin, codexAuthStatus, codexLogin, writeLoginInput } from "./agents/auth";
+import { claudeAuthStatus, claudeLogin, codexAuthStatus, codexLogin, writeLoginInput, type AuthStatus } from "./agents/auth";
+import { subscriptionVerdict } from "./agents/billing";
 import { pickBinary } from "./agents/binaries";
 import { ClaudeSession, listClaudeSessions, loadClaudeHistory } from "./agents/claude";
 import { CodexSession, listCodexSessions } from "./agents/codex";
@@ -377,6 +378,21 @@ function stopAgent(): void {
   agent = null;
 }
 
+// Subscription check before every session and turn (cached briefly; any login change clears it).
+const authCache = new Map<string, { at: number; status: AuthStatus }>();
+async function requireSubscription(kind: AgentKind, binPath: string): Promise<string | null> {
+  const key = `${kind}|${binPath}`;
+  let c = authCache.get(key);
+  if (!c || Date.now() - c.at > 5 * 60 * 1000) {
+    const status = kind === "claude" ? await claudeAuthStatus(binPath) : await codexAuthStatus(binPath, project?.dir ?? app.getPath("home"));
+    c = { at: Date.now(), status };
+    authCache.set(key, c);
+  }
+  const v = subscriptionVerdict(kind, c.status);
+  if (!v.ok) authCache.delete(key); // re-read next time (the user may fix the login meanwhile)
+  return v.ok ? null : v.error;
+}
+
 async function startAgent(kind: AgentKind, resumeId?: string): Promise<{ ok: boolean; error?: string; binary?: string; version?: string }> {
   if (!project) return { ok: false, error: "Open a project first." };
   stopAgent();
@@ -387,6 +403,9 @@ async function startAgent(kind: AgentKind, resumeId?: string): Promise<{ ok: boo
       ? "Claude Code was not found. Install the Claude Code VS Code extension or CLI, or set its path in Settings > Agents."
       : "Codex was not found. Install the ChatGPT/Codex VS Code extension or the codex CLI, or set its path in Settings > Agents." };
   }
+  // The subscription-only boundary is enforced here, not only shown in the account bar.
+  const refused = await requireSubscription(kind, bin.path);
+  if (refused) return { ok: false, error: refused };
   setSettings({ lastAgent: kind });
   const a: AgentSession = kind === "claude" ? new ClaudeSession() : new CodexSession();
   agent = a;
@@ -571,6 +590,10 @@ function registerIpc(): void {
       const r = await startAgent(getSettings().lastAgent);
       if (!r.ok) throw new Error(r.error);
     }
+    const s = getSettings();
+    const bin = pickBinary(agent!.kind, agent!.kind === "claude" ? s.claudePath : s.codexPath);
+    const refused = bin ? await requireSubscription(agent!.kind, bin.path) : "The agent binary is no longer available.";
+    if (refused) { stopAgent(); throw new Error(refused); }
     send("agent:event", agent!.kind, { type: "user", id: `u${Date.now()}`, text, ts: Date.now() } satisfies AgentEvent);
     await agent!.send(text);
     return true;
@@ -582,6 +605,7 @@ function registerIpc(): void {
     const s = getSettings();
     const bin = pickBinary(kind, kind === "claude" ? s.claudePath : s.codexPath);
     if (!bin) return { loggedIn: false, error: "not installed" };
+    authCache.clear();
     return kind === "claude" ? claudeAuthStatus(bin.path) : codexAuthStatus(bin.path, project?.dir ?? app.getPath("home"));
   });
   ipcMain.handle("agent:login", async (_e, kind: AgentKind) => {
@@ -590,6 +614,7 @@ function registerIpc(): void {
     if (!bin) return { loggedIn: false, error: "not installed" };
     const line = (l: string) => send("agent:login-output", kind, l);
     const r = kind === "claude" ? await claudeLogin(bin.path, line) : await codexLogin(bin.path, project?.dir ?? app.getPath("home"), line);
+    authCache.clear();
     send("agent:auth-changed", kind, r);
     return r;
   });
